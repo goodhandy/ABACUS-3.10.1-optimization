@@ -1,0 +1,10 @@
+This test for:
+*out descriptor
+*H2O
+*PW
+*kpoints gamma
+*sg15 pseudopotential
+*smearing_method gauss
+*ks_solver cg
+*mixing_type broyden
+*mixing_beta 0.4

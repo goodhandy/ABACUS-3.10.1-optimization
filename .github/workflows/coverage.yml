@@ -1,0 +1,34 @@
+name: Coverage Analysis
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+jobs:
+  test-coverage:
+    name: Generate Coverage Report
+    runs-on: X64
+    container: ghcr.io/deepmodeling/abacus-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Requirements for Coverage Testing
+        run: |
+          apt update && apt install -y lcov gpg
+      - name: Building
+        run: |
+          cmake -B build -DENABLE_COVERAGE=ON -DBUILD_TESTING=ON -DENABLE_DEEPKS=ON -DENABLE_LIBXC=ON -DENABLE_LIBRI=ON -DENABLE_PAW=ON -DENABLE_GOOGLEBENCH=ON -DENABLE_RAPIDJSON=ON
+          cmake --build build -j`nproc`
+          cmake --install build
+      - name: Testing
+        env:
+          OMP_NUM_THREADS: 1
+        run: |
+          cmake --build build --target test ARGS="-V --timeout 21600" || exit 0
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: ${{ ! cancelled() }}
+        with:
+          gcov: true
+          token: ${{ secrets.CODECOV_TOKEN }}
