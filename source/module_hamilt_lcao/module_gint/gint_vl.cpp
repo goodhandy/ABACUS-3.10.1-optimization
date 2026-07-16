@@ -40,8 +40,7 @@ namespace
  */
 inline int popcount64(const std::uint64_t value)
 {
-    return __builtin_popcountll(
-        static_cast<unsigned long long>(value));
+    return __builtin_popcountll(static_cast<unsigned long long>(value));
 }
 
 /**
@@ -58,8 +57,7 @@ inline int popcount64(const std::uint64_t value)
  */
 inline int ctz64(const std::uint64_t value)
 {
-    return __builtin_ctzll(
-        static_cast<unsigned long long>(value));
+    return __builtin_ctzll(static_cast<unsigned long long>(value));
 }
 
 /**
@@ -76,8 +74,7 @@ inline int ctz64(const std::uint64_t value)
  */
 inline int clz64(const std::uint64_t value)
 {
-    return __builtin_clzll(
-        static_cast<unsigned long long>(value));
+    return __builtin_clzll(static_cast<unsigned long long>(value));
 }
 
 
@@ -112,10 +109,7 @@ thread_local PreparedMaskCache prepared_mask_cache;
 /**
  * @brief 初始化本线程的掩码缓存并返回可写对象。
  */
-inline PreparedMaskCache& begin_prepare_mask_cache(
-    const int na_grid,
-    const int bxyz,
-    const bool* const* const cal_flag,
+inline PreparedMaskCache& begin_prepare_mask_cache(const int na_grid, const int bxyz, const bool* const* const cal_flag,
     const int expected_uses)
 {
     PreparedMaskCache& cache = prepared_mask_cache;
@@ -136,10 +130,7 @@ inline PreparedMaskCache& begin_prepare_mask_cache(
         cache.words.resize(required_words);
     }
 
-    std::fill(
-        cache.words.begin(),
-        cache.words.begin() + required_words,
-        std::uint64_t{0});
+    std::fill(cache.words.begin(), cache.words.begin() + required_words, std::uint64_t{0});
 
     return cache;
 }
@@ -152,10 +143,7 @@ inline PreparedMaskCache& begin_prepare_mask_cache(
  * - 或缓存维度、cal_flag 地址不匹配；
  * - 或缓存允许的消费次数已经用完。
  */
-inline const std::uint64_t* try_acquire_prepared_masks(
-    const int na_grid,
-    const int bxyz,
-    const int mask_words,
+inline const std::uint64_t* try_acquire_prepared_masks(const int na_grid, const int bxyz, const int mask_words,
     const bool* const* const cal_flag)
 {
     PreparedMaskCache& cache = prepared_mask_cache;
@@ -209,11 +197,7 @@ inline const std::uint64_t* try_acquire_prepared_masks(
  * 3. 后续原子对求交只需要按位与操作；
  * 4. 自动兼容 bxyz>128 的情况。
  */
-inline void build_atom_masks(
-    const int na_grid,
-    const int bxyz,
-    const int mask_words,
-    const bool* const* const cal_flag,
+inline void build_atom_masks(const int na_grid, const int bxyz, const int mask_words, const bool* const* const cal_flag,
     std::uint64_t* const atom_masks)
 {
     // 位掩码总字数 = 原子数 × 每个原子所需的64位字数。
@@ -221,10 +205,7 @@ inline void build_atom_masks(
 
     // thread_local 缓冲区会在不同网格块之间复用，因此每次构造前
     // 必须将当前有效区域清零，避免残留上一个网格块的置位比特。
-    std::fill(
-        atom_masks,
-        atom_masks + total_words,
-        std::uint64_t{0});
+    std::fill(atom_masks, atom_masks + total_words, std::uint64_t{0});
 
     // 逐网格点读取 cal_flag。由于 cal_flag 的第一维是 ib，
     // 该循环顺序保持了原数据在原子方向上的连续访问。
@@ -275,13 +256,8 @@ inline void build_atom_masks(
  * - 稀疏分支仍然对每个有效网格点调用一次 k=1 的 DGEMM；
  * - 有效网格点集合、DGEMM 调用次数和调用顺序保持不变。
  */
-inline bool analyse_pair_mask(
-    const std::uint64_t* const mask1,
-    const std::uint64_t* const mask2,
-    const int mask_words,
-    int& first_ib,
-    int& last_ib,
-    int& cal_pair_num)
+inline bool analyse_pair_mask(const std::uint64_t* const mask1, const std::uint64_t* const mask2, const int mask_words, int& first_ib,
+    int& last_ib, int& cal_pair_num)
 {
     // 记录第一个和最后一个非零交集字的位置。
     int first_word = -1;
@@ -357,25 +333,24 @@ namespace GintVlocalFusion
 {
 
 /**
- * @brief 转置一个普通面板，并在同一次 cal_flag 扫描中构造原子位掩码。
+ * @brief 同源路径一次遍历生成两个转置面板和原子位掩码。
  *
- * 输入：src[ib][iorb]
- * 输出：dst_T[iorb][ib]
+ * 输入源只有 psir_ylm：
+ *     psir_right_T[iorb][ib] = src[ib][iorb]
+ *     psir_left_T[iorb][ib] = scale[ib] * src[ib][iorb]
  *
- * 普通 vlocal 先仅将 psir_ylm 转置为 psir_ylm_T，同时准备
- * cal_meshball_vlocal 后续需要的原子位掩码。
+ * 每个源元素只显式读取一次，同时写入两个最终面板。
  */
-void build_transposed_panel_and_masks(
-    int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag,
-    const double* const* src, double* const* dst_T, int expected_mask_uses)
+void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag,
+    const double* scale, const double* const* src, double* const* psir_right_T, double* const* psir_left_T, int expected_mask_uses)
 {
-    PreparedMaskCache& cache =
-        begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
+    PreparedMaskCache& cache = begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
 
     for (int ib = 0; ib < bxyz; ++ib)
     {
         const int word_index = ib / 64;
         const std::uint64_t bit = std::uint64_t{1} << (ib % 64);
+        const double scale_value = scale[ib];
         const double* src_row = src[ib];
 
         for (int ia = 0; ia < na_grid; ++ia)
@@ -386,16 +361,20 @@ void build_transposed_panel_and_masks(
             if (cal_flag[ib][ia])
             {
                 cache.words[static_cast<std::size_t>(ia) * cache.mask_words + word_index] |= bit;
+
                 for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
-                    dst_T[iorb][ib] = src_row[iorb];
+                    const double value = src_row[iorb];
+                    psir_right_T[iorb][ib] = value;
+                    psir_left_T[iorb][ib] = scale_value * value;
                 }
             }
             else
             {
                 for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
-                    dst_T[iorb][ib] = 0.0;
+                    psir_right_T[iorb][ib] = 0.0;
+                    psir_left_T[iorb][ib] = 0.0;
                 }
             }
         }
@@ -418,23 +397,12 @@ void build_transposed_panel_and_masks(
  * 这样 cal_flag 只在面板生成阶段扫描一次，
  * cal_meshball_vlocal 不再重复执行完整的掩码构造遍历。
  */
-void build_two_transposed_panels_and_masks(
-    const int bxyz,
-    const int na_grid,
-    const int* const block_index,
-    const bool* const* const cal_flag,
-    const double* const scale,
-    const double* const* const psir_right_source,
-    const double* const* const psir_left_source,
-    double* const* const psir_right_T,
-    double* const* const psir_left_T,
+void build_two_transposed_panels_and_masks(const int bxyz, const int na_grid, const int* const block_index,
+    const bool* const* const cal_flag, const double* const scale, const double* const* const psir_right_source,
+    const double* const* const psir_left_source, double* const* const psir_right_T, double* const* const psir_left_T,
     const int expected_mask_uses)
 {
-    PreparedMaskCache& cache = begin_prepare_mask_cache(
-            na_grid,
-            bxyz,
-            cal_flag,
-            expected_mask_uses);
+    PreparedMaskCache& cache = begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
 
     for (int ib = 0; ib < bxyz; ++ib)
     {
@@ -495,21 +463,11 @@ void build_two_transposed_panels_and_masks(
  * 该函数用于 dvlocal：
  * 左面板会被 x/y/z 三次收缩共同复用，因此位掩码也允许消费3次。
  */
-void build_scaled_transposed_panel_and_masks(
-    const int bxyz,
-    const int na_grid,
-    const int* const block_index,
-    const bool* const* const cal_flag,
-    const double* const scale,
-    const double* const* const src,
-    double* const* const dst_T,
+void build_scaled_transposed_panel_and_masks(const int bxyz, const int na_grid, const int* const block_index,
+    const bool* const* const cal_flag, const double* const scale, const double* const* const src, double* const* const dst_T,
     const int expected_mask_uses)
 {
-    PreparedMaskCache& cache = begin_prepare_mask_cache(
-            na_grid,
-            bxyz,
-            cal_flag,
-            expected_mask_uses);
+    PreparedMaskCache& cache = begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
 
     for (int ib = 0; ib < bxyz; ++ib)
     {
@@ -602,11 +560,7 @@ void Gint::cal_meshball_vlocal(
     // ---------------------------------------------------------------------
     const int mask_words = (bxyz_local + 63) / 64;
 
-    const std::uint64_t* atom_masks_ptr = try_acquire_prepared_masks(
-            na_grid,
-            bxyz_local,
-            mask_words,
-            cal_flag);
+    const std::uint64_t* atom_masks_ptr = try_acquire_prepared_masks(na_grid, bxyz_local, mask_words, cal_flag);
 
     /*
      * 兼容回退路径：
@@ -625,16 +579,10 @@ void Gint::cal_meshball_vlocal(
         if (fallback_atom_masks.size()
             < required_mask_words)
         {
-            fallback_atom_masks.resize(
-                required_mask_words);
+            fallback_atom_masks.resize(required_mask_words);
         }
 
-        build_atom_masks(
-            na_grid,
-            bxyz_local,
-            mask_words,
-            cal_flag,
-            fallback_atom_masks.data());
+        build_atom_masks(na_grid, bxyz_local, mask_words, cal_flag, fallback_atom_masks.data());
 
         atom_masks_ptr = fallback_atom_masks.data();
     }
@@ -688,13 +636,7 @@ void Gint::cal_meshball_vlocal(
             // 4. 有效网格点总数。
             //
             // 这替代了原代码针对每个原子对的多次 cal_flag 扫描。
-            const bool has_overlap = analyse_pair_mask(
-                    mask1,
-                    mask2,
-                    mask_words,
-                    first_ib,
-                    last_ib,
-                    cal_pair_num);
+            const bool has_overlap = analyse_pair_mask(mask1, mask2, mask_words, first_ib, last_ib, cal_pair_num);
 
             if (!has_overlap)
             {
@@ -703,10 +645,7 @@ void Gint::cal_meshball_vlocal(
 
             const int ib_length = last_ib - first_ib;
 
-            const auto tmp_matrix = hR->find_matrix(
-                    iat1,
-                    iat2,
-                    r1 - r2);
+            const auto tmp_matrix = hR->find_matrix(iat1, iat2, r1 - r2);
 
             if (tmp_matrix == nullptr)
             {
@@ -736,20 +675,7 @@ void Gint::cal_meshball_vlocal(
                 const double* const ptr_b = right_block
                     + first_ib;
 
-                dgemm_(
-                    &transa,
-                    &transb,
-                    &n,
-                    &m,
-                    &ib_length,
-                    &alpha,
-                    ptr_a,
-                    &ldt,
-                    ptr_b,
-                    &ldt,
-                    &beta,
-                    tmp_matrix->get_pointer(),
-                    &n);
+                dgemm_(&transa, &transb, &n, &m, &ib_length, &alpha, ptr_a, &ldt, ptr_b, &ldt, &beta, tmp_matrix->get_pointer(), &n);
             }
             else
             {
@@ -799,20 +725,7 @@ void Gint::cal_meshball_vlocal(
                          * 每个共同有效网格点仍执行一次 k=1 的 DGEMM，
                          * 并直接累加到 tmp_matrix。
                          */
-                        dgemm_(
-                            &transa,
-                            &transb,
-                            &n,
-                            &m,
-                            &k,
-                            &alpha,
-                            ptr_a,
-                            &ldt,
-                            ptr_b,
-                            &ldt,
-                            &beta,
-                            tmp_matrix->get_pointer(),
-                            &n);
+                        dgemm_(&transa, &transb, &n, &m, &k, &alpha, ptr_a, &ldt, ptr_b, &ldt, &beta, tmp_matrix->get_pointer(), &n);
 
                         // 清除最低置位比特，继续处理下一个有效网格点。
                         pair_word &= pair_word - 1;
