@@ -226,10 +226,12 @@ inline void build_atom_masks(
  *
  * 这些量与原代码通过三次 cal_flag 扫描得到的结果完全一致。
  *
- * 本轮优化严格限制为“只优化统计过程”：
+ * 本轮优化在上一版“位掩码统计”的基础上进一步扩展：
  * - 稠密/稀疏判断阈值不变；
- * - 稀疏分支仍使用 cal_flag 逐点检查；
- * - DGEMM 的调用方式和计算点集合不变。
+ * - 稠密分支完全不变；
+ * - 稀疏分支直接遍历原子对交集掩码中的置位位；
+ * - 稀疏分支仍然对每个有效网格点调用一次 k=1 的 DGEMM；
+ * - 有效网格点集合、DGEMM 调用次数和调用顺序保持不变。
  */
 inline bool analyse_pair_mask(
     const std::uint64_t* const mask1,
@@ -395,7 +397,7 @@ void Gint::cal_meshball_vlocal(
         atom_masks.data());
 
     // ---------------------------------------------------------------------
-    // 第三步：保留原来的稀疏/稠密分支
+    // 第三步：稠密分支保持不变，稀疏分支直接遍历位掩码置位位
     // ---------------------------------------------------------------------
     const char transa = 'T';
     const char transb = 'N';
@@ -526,18 +528,42 @@ void Gint::cal_meshball_vlocal(
             }
             else
             {
-                // 稀疏分支仍然使用 cal_flag 逐点检查。
-                //
-                // 这里故意不直接遍历位掩码中的置位比特，
-                // 是为了保证本轮实验只改变统计过程，
-                // 不改变稀疏分支原有的访问顺序和 DGEMM 调用方式。
-                for (int ib = first_ib;
-                     ib < last_ib;
-                     ++ib)
+                /*
+                 * 稀疏分支：
+                 *
+                 * 不再扫描 [first_ib, last_ib) 区间，也不再逐点读取
+                 * cal_flag[ib][ia1] 和 cal_flag[ib][ia2]。
+                 *
+                 * 对每个64位字计算两个原子掩码的交集：
+                 *
+                 *     pair_word = mask1[iw] & mask2[iw]
+                 *
+                 * pair_word 中值为1的比特就是共同有效的网格点。
+                 * 每次使用 ctz64 找到最低置位比特，并通过：
+                 *
+                 *     pair_word &= pair_word - 1
+                 *
+                 * 清除该置位比特。
+                 *
+                 * mask_words 按递增顺序遍历，每个字内部也始终先处理
+                 * 最低置位比特，所以有效网格点 ib 的处理顺序仍然严格递增，
+                 * 与原来从 first_ib 扫描到 last_ib 的调用顺序一致。
+                 */
+                for (int iw = 0; iw < mask_words; ++iw)
                 {
-                    if (cal_flag[ib][ia1]
-                        && cal_flag[ib][ia2])
+                    std::uint64_t pair_word
+                        = mask1[iw] & mask2[iw];
+
+                    while (pair_word != 0)
                     {
+                        // 找到当前64位字中最低的置位比特。
+                        const int bit_index
+                            = ctz64(pair_word);
+
+                        // 转换为当前网格块中的全局网格点编号。
+                        const int ib
+                            = iw * 64 + bit_index;
+
                         const int k = 1;
 
                         const double* const ptr_a
@@ -550,6 +576,11 @@ void Gint::cal_meshball_vlocal(
                             + base_b
                             + ib;
 
+                        /*
+                         * 保持原稀疏分支的计算方式：
+                         * 每个共同有效网格点仍执行一次 k=1 的 DGEMM，
+                         * 并直接累加到 tmp_matrix。
+                         */
                         dgemm_(
                             &transa,
                             &transb,
@@ -564,6 +595,9 @@ void Gint::cal_meshball_vlocal(
                             &beta,
                             tmp_matrix->get_pointer(),
                             &n);
+
+                        // 清除最低置位比特，继续处理下一个有效网格点。
+                        pair_word &= pair_word - 1;
                     }
                 }
             }
