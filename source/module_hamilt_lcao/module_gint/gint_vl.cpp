@@ -80,6 +80,106 @@ inline int clz64(const std::uint64_t value)
         static_cast<unsigned long long>(value));
 }
 
+
+/**
+ * @brief 上层面板生成阶段准备的线程本地原子位掩码缓存。
+ *
+ * 面板生成与 cal_meshball_vlocal 在同一个 OpenMP 线程中连续执行，
+ * 因而可以通过 thread_local 缓存传递位掩码，避免再次扫描 cal_flag。
+ *
+ * remaining_uses 用于限制当前缓存可被消费的次数：
+ * - vlocal：1次；
+ * - dvlocal：3次；
+ * - meta：4次。
+ *
+ * 当其他调用路径没有提前准备缓存时，cal_meshball_vlocal 会自动
+ * 回退到原来的 build_atom_masks 逻辑，保证兼容性。
+ */
+struct PreparedMaskCache
+{
+    std::vector<std::uint64_t> words;
+
+    const bool* const* cal_flag_identity = nullptr;
+
+    int na_grid = 0;
+    int bxyz = 0;
+    int mask_words = 0;
+    int remaining_uses = 0;
+};
+
+thread_local PreparedMaskCache prepared_mask_cache;
+
+/**
+ * @brief 初始化本线程的掩码缓存并返回可写对象。
+ */
+inline PreparedMaskCache& begin_prepare_mask_cache(
+    const int na_grid,
+    const int bxyz,
+    const bool* const* const cal_flag,
+    const int expected_uses)
+{
+    PreparedMaskCache& cache
+        = prepared_mask_cache;
+
+    cache.na_grid = na_grid;
+    cache.bxyz = bxyz;
+    cache.mask_words
+        = (bxyz + 63) / 64;
+
+    cache.cal_flag_identity
+        = cal_flag;
+
+    cache.remaining_uses
+        = expected_uses;
+
+    const std::size_t required_words
+        = static_cast<std::size_t>(na_grid)
+        * cache.mask_words;
+
+    if (cache.words.size() < required_words)
+    {
+        cache.words.resize(required_words);
+    }
+
+    std::fill(
+        cache.words.begin(),
+        cache.words.begin() + required_words,
+        std::uint64_t{0});
+
+    return cache;
+}
+
+/**
+ * @brief 尝试取得上层已经准备好的位掩码。
+ *
+ * 返回 nullptr 表示：
+ * - 当前调用者没有提前准备缓存；
+ * - 或缓存维度、cal_flag 地址不匹配；
+ * - 或缓存允许的消费次数已经用完。
+ */
+inline const std::uint64_t* try_acquire_prepared_masks(
+    const int na_grid,
+    const int bxyz,
+    const int mask_words,
+    const bool* const* const cal_flag)
+{
+    PreparedMaskCache& cache
+        = prepared_mask_cache;
+
+    if (cache.remaining_uses <= 0
+        || cache.na_grid != na_grid
+        || cache.bxyz != bxyz
+        || cache.mask_words != mask_words
+        || cache.cal_flag_identity != cal_flag)
+    {
+        return nullptr;
+    }
+
+    --cache.remaining_uses;
+
+    return cache.words.data();
+}
+
 /**
  * @brief 为当前网格块中的每个原子构造动态长度位掩码。
  *
@@ -262,7 +362,194 @@ inline bool analyse_pair_mask(
     return true;
 }
 
+
 } // 匿名命名空间
+
+namespace GintVlocalFusion
+{
+
+/**
+ * @brief 一次遍历同时生成两个转置面板和原子位掩码。
+ *
+ * 输出：
+ *
+ *     psir_right_T[iorb][ib]
+ *         = psir_right_source[ib][iorb]
+ *
+ *     psir_left_T[iorb][ib]
+ *         = scale[ib] * psir_left_source[ib][iorb]
+ *
+ * 同时将 cal_flag[ib][ia] 压缩到线程本地 uint64_t 位掩码中。
+ *
+ * 这样 cal_flag 只在面板生成阶段扫描一次，
+ * cal_meshball_vlocal 不再重复执行完整的掩码构造遍历。
+ */
+void build_two_transposed_panels_and_masks(
+    const int bxyz,
+    const int na_grid,
+    const int* const block_index,
+    const bool* const* const cal_flag,
+    const double* const scale,
+    const double* const* const psir_right_source,
+    const double* const* const psir_left_source,
+    double* const* const psir_right_T,
+    double* const* const psir_left_T,
+    const int expected_mask_uses)
+{
+    PreparedMaskCache& cache
+        = begin_prepare_mask_cache(
+            na_grid,
+            bxyz,
+            cal_flag,
+            expected_mask_uses);
+
+    for (int ib = 0; ib < bxyz; ++ib)
+    {
+        const int word_index
+            = ib / 64;
+
+        const int bit_index
+            = ib % 64;
+
+        const std::uint64_t bit
+            = std::uint64_t{1} << bit_index;
+
+        const double* const right_src_row
+            = psir_right_source[ib];
+
+        const double* const left_src_row
+            = psir_left_source[ib];
+
+        const double scale_value
+            = scale[ib];
+
+        for (int ia = 0; ia < na_grid; ++ia)
+        {
+            const int orbital_begin
+                = block_index[ia];
+
+            const int orbital_end
+                = block_index[ia + 1];
+
+            const bool active
+                = cal_flag[ib][ia];
+
+            if (active)
+            {
+                cache.words[
+                    static_cast<std::size_t>(ia)
+                    * cache.mask_words
+                    + word_index] |= bit;
+
+                for (int iorb = orbital_begin;
+                     iorb < orbital_end;
+                     ++iorb)
+                {
+                    psir_right_T[iorb][ib]
+                        = right_src_row[iorb];
+
+                    psir_left_T[iorb][ib]
+                        = scale_value
+                        * left_src_row[iorb];
+                }
+            }
+            else
+            {
+                for (int iorb = orbital_begin;
+                     iorb < orbital_end;
+                     ++iorb)
+                {
+                    psir_right_T[iorb][ib] = 0.0;
+                    psir_left_T[iorb][ib] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief 一次遍历生成缩放后的左转置面板和原子位掩码。
+ *
+ * 该函数用于 dvlocal：
+ * 左面板会被 x/y/z 三次收缩共同复用，因此位掩码也允许消费3次。
+ */
+void build_scaled_transposed_panel_and_masks(
+    const int bxyz,
+    const int na_grid,
+    const int* const block_index,
+    const bool* const* const cal_flag,
+    const double* const scale,
+    const double* const* const src,
+    double* const* const dst_T,
+    const int expected_mask_uses)
+{
+    PreparedMaskCache& cache
+        = begin_prepare_mask_cache(
+            na_grid,
+            bxyz,
+            cal_flag,
+            expected_mask_uses);
+
+    for (int ib = 0; ib < bxyz; ++ib)
+    {
+        const int word_index
+            = ib / 64;
+
+        const int bit_index
+            = ib % 64;
+
+        const std::uint64_t bit
+            = std::uint64_t{1} << bit_index;
+
+        const double* const src_row
+            = src[ib];
+
+        const double scale_value
+            = scale[ib];
+
+        for (int ia = 0; ia < na_grid; ++ia)
+        {
+            const int orbital_begin
+                = block_index[ia];
+
+            const int orbital_end
+                = block_index[ia + 1];
+
+            const bool active
+                = cal_flag[ib][ia];
+
+            if (active)
+            {
+                cache.words[
+                    static_cast<std::size_t>(ia)
+                    * cache.mask_words
+                    + word_index] |= bit;
+
+                for (int iorb = orbital_begin;
+                     iorb < orbital_end;
+                     ++iorb)
+                {
+                    dst_T[iorb][ib]
+                        = scale_value
+                        * src_row[iorb];
+                }
+            }
+            else
+            {
+                for (int iorb = orbital_begin;
+                     iorb < orbital_end;
+                     ++iorb)
+                {
+                    dst_T[iorb][ib] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+} // namespace GintVlocalFusion
+
+
 
 void Gint::cal_meshball_vlocal(
     const int na_grid,                          // 当前网格块中的原子数
@@ -299,38 +586,50 @@ void Gint::cal_meshball_vlocal(
     const int ldt = bxyz_local;
 
     // ---------------------------------------------------------------------
-    // 第二步：构造动态长度位掩码
+    // 第二步：优先复用上层面板生成阶段同步构造的位掩码
     // ---------------------------------------------------------------------
-    //
-    // 向上取整计算每个原子需要多少个64位字：
-    //
-    // bxyz=1~64    -> mask_words=1
-    // bxyz=65~128  -> mask_words=2
-    // bxyz=129~192 -> mask_words=3
-    //
-    // 当前 Si512 算例 bxyz=75，因此每个原子使用2个 uint64_t。
     const int mask_words
         = (bxyz_local + 63) / 64;
 
-    // 每个 OpenMP 线程拥有独立的位掩码缓冲区，
-    // 避免线程之间的数据竞争。
-    // 缓冲区只在容量不足时扩容，避免每个网格块反复申请内存。
-    thread_local std::vector<std::uint64_t> atom_masks;
+    const std::uint64_t* atom_masks_ptr
+        = try_acquire_prepared_masks(
+            na_grid,
+            bxyz_local,
+            mask_words,
+            cal_flag);
 
-    const std::size_t required_mask_words
-        = static_cast<std::size_t>(na_grid) * mask_words;
+    /*
+     * 兼容回退路径：
+     *
+     * 若其他调用者没有使用融合生成函数提前准备掩码，
+     * 仍按原方式在本函数中构造位掩码。
+     */
+    thread_local std::vector<std::uint64_t>
+        fallback_atom_masks;
 
-    if (atom_masks.size() < required_mask_words)
+    if (atom_masks_ptr == nullptr)
     {
-        atom_masks.resize(required_mask_words);
-    }
+        const std::size_t required_mask_words
+            = static_cast<std::size_t>(na_grid)
+            * mask_words;
 
-    build_atom_masks(
-        na_grid,
-        bxyz_local,
-        mask_words,
-        cal_flag,
-        atom_masks.data());
+        if (fallback_atom_masks.size()
+            < required_mask_words)
+        {
+            fallback_atom_masks.resize(
+                required_mask_words);
+        }
+
+        build_atom_masks(
+            na_grid,
+            bxyz_local,
+            mask_words,
+            cal_flag,
+            fallback_atom_masks.data());
+
+        atom_masks_ptr
+            = fallback_atom_masks.data();
+    }
 
     // ---------------------------------------------------------------------
     // 第三步：直接使用两个转置面板执行原有稠密/稀疏路径
@@ -354,7 +653,7 @@ void Gint::cal_meshball_vlocal(
         // 当前原子 ia1 的位掩码起始地址。
         // mask1[0...mask_words-1] 表示该原子的全部网格点有效性。
         const std::uint64_t* const mask1
-            = atom_masks.data()
+            = atom_masks_ptr
             + static_cast<std::size_t>(ia1) * mask_words;
 
         for (int ia2 = 0; ia2 < na_grid; ++ia2)
@@ -372,7 +671,7 @@ void Gint::cal_meshball_vlocal(
 
             // 当前原子 ia2 的位掩码起始地址。
             const std::uint64_t* const mask2
-                = atom_masks.data()
+                = atom_masks_ptr
                 + static_cast<std::size_t>(ia2) * mask_words;
 
             int first_ib = 0;

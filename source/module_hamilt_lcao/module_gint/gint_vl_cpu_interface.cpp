@@ -9,6 +9,34 @@
 #include <cstdio>
 #include <vector>
 
+
+namespace GintVlocalFusion
+{
+
+void build_two_transposed_panels_and_masks(
+    int bxyz,
+    int na_grid,
+    const int* block_index,
+    const bool* const* cal_flag,
+    const double* scale,
+    const double* const* psir_right_source,
+    const double* const* psir_left_source,
+    double* const* psir_right_T,
+    double* const* psir_left_T,
+    int expected_mask_uses);
+
+void build_scaled_transposed_panel_and_masks(
+    int bxyz,
+    int na_grid,
+    const int* block_index,
+    const bool* const* cal_flag,
+    const double* scale,
+    const double* const* src,
+    double* const* dst_T,
+    int expected_mask_uses);
+
+} // namespace GintVlocalFusion
+
 namespace
 {
 
@@ -34,7 +62,7 @@ namespace
  * 对 cal_flag[ib][ia] 为 false 的原子轨道块显式写0，保证稠密
  * DGEMM 在首尾区间中计算空洞位置时仍保持原来的数值语义。
  */
-inline void build_two_transposed_panels(
+inline void build_two_transposed_panels_without_masks(
     const int bxyz,
     const int na_grid,
     const int* const block_index,
@@ -419,16 +447,18 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
              */
             (void)psir_ylm_2;
 
-            build_two_transposed_panels(
-                this->bxyz,
-                na_grid,
-                block_index.data(),
-                cal_flag.get_ptr_2D(),
-                vldr3.data(),
-                psir_ylm.get_ptr_2D(),
-                psir_ylm_1.get_ptr_2D(),
-                psir_right_T.get_ptr_2D(),
-                psir_vlbr3_T.get_ptr_2D());
+            GintVlocalFusion::
+                build_two_transposed_panels_and_masks(
+                    this->bxyz,
+                    na_grid,
+                    block_index.data(),
+                    cal_flag.get_ptr_2D(),
+                    vldr3.data(),
+                    psir_ylm.get_ptr_2D(),
+                    psir_ylm_1.get_ptr_2D(),
+                    psir_right_T.get_ptr_2D(),
+                    psir_vlbr3_T.get_ptr_2D(),
+                    1);
 
             t_end
                 = std::chrono::steady_clock::now();
@@ -685,14 +715,16 @@ void Gint::gint_kernel_dvlocal(Gint_inout* inout)
                     LD_pool,
                     this->bxyz);
 
-            build_scaled_transposed_panel(
-                this->bxyz,
-                na_grid,
-                block_index.data(),
-                cal_flag.get_ptr_2D(),
-                vldr3.data(),
-                psir_ylm.get_ptr_2D(),
-                psir_vlbr3_T.get_ptr_2D());
+            GintVlocalFusion::
+                build_scaled_transposed_panel_and_masks(
+                    this->bxyz,
+                    na_grid,
+                    block_index.data(),
+                    cal_flag.get_ptr_2D(),
+                    vldr3.data(),
+                    psir_ylm.get_ptr_2D(),
+                    psir_vlbr3_T.get_ptr_2D(),
+                    3);
 
             // x 方向。
             {
@@ -997,16 +1029,18 @@ void Gint::gint_kernel_vlocal_meta(
                         LD_pool,
                         this->bxyz);
 
-                build_two_transposed_panels(
-                    this->bxyz,
-                    na_grid,
-                    block_index.data(),
-                    cal_flag.get_ptr_2D(),
-                    vldr3.data(),
-                    psir_ylm.get_ptr_2D(),
-                    psir_ylm.get_ptr_2D(),
-                    right_T.get_ptr_2D(),
-                    left_T.get_ptr_2D());
+                GintVlocalFusion::
+                    build_two_transposed_panels_and_masks(
+                        this->bxyz,
+                        na_grid,
+                        block_index.data(),
+                        cal_flag.get_ptr_2D(),
+                        vldr3.data(),
+                        psir_ylm.get_ptr_2D(),
+                        psir_ylm.get_ptr_2D(),
+                        right_T.get_ptr_2D(),
+                        left_T.get_ptr_2D(),
+                        4);
 
                 this->cal_meshball_vlocal(
                     na_grid,
@@ -1032,7 +1066,7 @@ void Gint::gint_kernel_vlocal_meta(
                         LD_pool,
                         this->bxyz);
 
-                build_two_transposed_panels(
+                build_two_transposed_panels_without_masks(
                     this->bxyz,
                     na_grid,
                     block_index.data(),
@@ -1069,7 +1103,7 @@ void Gint::gint_kernel_vlocal_meta(
                         LD_pool,
                         this->bxyz);
 
-                build_two_transposed_panels(
+                build_two_transposed_panels_without_masks(
                     this->bxyz,
                     na_grid,
                     block_index.data(),
@@ -1106,7 +1140,7 @@ void Gint::gint_kernel_vlocal_meta(
                         LD_pool,
                         this->bxyz);
 
-                build_two_transposed_panels(
+                build_two_transposed_panels_without_masks(
                     this->bxyz,
                     na_grid,
                     block_index.data(),
