@@ -81,42 +81,6 @@ inline int clz64(const std::uint64_t value)
 }
 
 /**
- * @brief 将 psir_ylm 从 [bxyz][LD_pool] 简单转置为 [LD_pool][bxyz]。
- *
- * 本轮实验只融合 psir_vlbr3 的生成与转置：
- *
- * - psir_vlbr3 已由上层直接生成成 [LD_pool][bxyz]；
- * - psir_ylm 仍保持原来的 [bxyz][LD_pool] 布局；
- * - 因此这里只需要转置 psir_ylm。
- *
- * 转置顺序仍采用此前验证较快的简单方案：
- * 1. 网格点 ib 为外层循环；
- * 2. 轨道 iorb 为内层循环；
- * 3. 源矩阵沿轨道方向连续读取；
- * 4. 不引入按原子分块或额外局部 tile。
- */
-inline void transpose_one_matrix_simple(
-    const int bxyz,
-    const int LD_pool,
-    const int ldt,
-    const double* const* const src_ylm,
-    double* const dst_ylm)
-{
-    for (int ib = 0; ib < bxyz; ++ib)
-    {
-        const double* const src_ylm_row = src_ylm[ib];
-
-        for (int iorb = 0; iorb < LD_pool; ++iorb)
-        {
-            const std::size_t dst_index
-                = static_cast<std::size_t>(iorb) * ldt + ib;
-
-            dst_ylm[dst_index] = src_ylm_row[iorb];
-        }
-    }
-}
-
-/**
  * @brief 为当前网格块中的每个原子构造动态长度位掩码。
  *
  * 原代码使用：
@@ -307,8 +271,8 @@ void Gint::cal_meshball_vlocal(
     const int* const block_index,               // 各原子轨道在轨道池中的起始位置
     const int grid_index,
     const bool* const* const cal_flag,           // cal_flag[bxyz][na_grid]
-    const double* const* const psir_right,       // 普通布局 [bxyz][LD_pool]
-    const double* const* const psir_left_T,      // 已转置布局 [LD_pool][bxyz]
+    const double* const* const psir_right_T,     // 已转置右面板 [LD_pool][bxyz]
+    const double* const* const psir_left_T,      // 已转置左面板 [LD_pool][bxyz]
     hamilt::HContainer<double>* hR)
 {
     const int bxyz_local = this->bxyz;
@@ -319,31 +283,20 @@ void Gint::cal_meshball_vlocal(
     }
 
     // ---------------------------------------------------------------------
-    // 第一步：只转置 psir_ylm
+    // 第一步：直接消费上层生成的两个转置面板
     // ---------------------------------------------------------------------
     //
-    // 第二个矩阵 psir_left_T 已由上层直接准备成 [LD_pool][bxyz]。
-    // 对普通 vlocal 路径，它就是融合生成的 psir_vlbr3_T；
-    // 对其他复用该收缩函数的路径，它也必须由调用者提前转置。
-    // 因此这里只转置第一个输入 psir_right。
+    // psir_right_T 和 psir_left_T 的逻辑布局均为：
+    //
+    //     [LD_pool][bxyz]
+    //
+    // 即每条轨道在网格点方向连续存储。调用者已经完成：
+    //
+    // 1. 右面板的布局转换；
+    // 2. 左面板的局域势缩放与布局转换。
+    //
+    // 因此本函数中不再分配完整转置缓冲区，也不再执行显式转置。
     const int ldt = bxyz_local;
-
-    thread_local std::vector<double> ylm_T;
-
-    const std::size_t transposed_size
-        = static_cast<std::size_t>(LD_pool) * ldt;
-
-    if (ylm_T.size() < transposed_size)
-    {
-        ylm_T.resize(transposed_size);
-    }
-
-    transpose_one_matrix_simple(
-        bxyz_local,
-        LD_pool,
-        ldt,
-        psir_right,
-        ylm_T.data());
 
     // ---------------------------------------------------------------------
     // 第二步：构造动态长度位掩码
@@ -380,7 +333,7 @@ void Gint::cal_meshball_vlocal(
         atom_masks.data());
 
     // ---------------------------------------------------------------------
-    // 第三步：稠密分支保持不变，稀疏分支直接遍历位掩码置位位
+    // 第三步：直接使用两个转置面板执行原有稠密/稀疏路径
     // ---------------------------------------------------------------------
     const char transa = 'T';
     const char transb = 'N';
@@ -467,15 +420,13 @@ void Gint::cal_meshball_vlocal(
             const int n
                 = tmp_matrix->get_col_size();
 
-            // 第二个输入已经是 [LD_pool][bxyz] 布局，
-            // block_index[ia2] 直接选中 ia2 的第一条轨道行。
+            // 两个输入均已经是 [LD_pool][bxyz] 布局。
+            // block_index 直接定位相应原子的第一条轨道行。
             const double* const left_block
                 = psir_left_T[block_index[ia2]];
 
-            const std::size_t base_b
-                = static_cast<std::size_t>(
-                      block_index[ia1])
-                  * ldt;
+            const double* const right_block
+                = psir_right_T[block_index[ia1]];
 
             // 完全保留原代码的稀疏/稠密判断条件。
             //
@@ -489,8 +440,7 @@ void Gint::cal_meshball_vlocal(
                     + first_ib;
 
                 const double* const ptr_b
-                    = ylm_T.data()
-                    + base_b
+                    = right_block
                     + first_ib;
 
                 dgemm_(
@@ -553,8 +503,7 @@ void Gint::cal_meshball_vlocal(
                             + ib;
 
                         const double* const ptr_b
-                            = ylm_T.data()
-                            + base_b
+                            = right_block
                             + ib;
 
                         /*
