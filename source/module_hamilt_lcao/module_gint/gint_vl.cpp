@@ -226,12 +226,13 @@ inline void build_atom_masks(
  *
  * 这些量与原代码通过三次 cal_flag 扫描得到的结果完全一致。
  *
- * 本轮优化在上一版“位掩码统计”的基础上进一步扩展：
+ * 本轮优化在上一版“直接遍历置位位”的基础上继续扩展：
  * - 稠密/稀疏判断阈值不变；
  * - 稠密分支完全不变；
- * - 稀疏分支直接遍历原子对交集掩码中的置位位；
- * - 稀疏分支仍然对每个有效网格点调用一次 k=1 的 DGEMM；
- * - 有效网格点集合、DGEMM 调用次数和调用顺序保持不变。
+ * - 稀疏分支仍直接遍历原子对交集掩码中的置位位；
+ * - 将相邻的有效网格点合并为一个连续段；
+ * - 每个连续段只调用一次 k=run_length 的 DGEMM；
+ * - 不引入数据打包、临时结果矩阵或 Scatter。
  */
 inline bool analyse_pair_mask(
     const std::uint64_t* const mask1,
@@ -397,7 +398,7 @@ void Gint::cal_meshball_vlocal(
         atom_masks.data());
 
     // ---------------------------------------------------------------------
-    // 第三步：稠密分支保持不变，稀疏分支直接遍历位掩码置位位
+    // 第三步：稠密分支保持不变，稀疏分支使用连续段 Run-GEMM
     // ---------------------------------------------------------------------
     const char transa = 'T';
     const char transb = 'N';
@@ -529,25 +530,91 @@ void Gint::cal_meshball_vlocal(
             else
             {
                 /*
-                 * 稀疏分支：
+                 * 稀疏分支：连续段 Run-GEMM。
                  *
-                 * 不再扫描 [first_ib, last_ib) 区间，也不再逐点读取
-                 * cal_flag[ib][ia1] 和 cal_flag[ib][ia2]。
+                 * 上一版已经能够按递增顺序直接遍历交集掩码中的置位位，
+                 * 但仍然对每个有效网格点调用一次 k=1 的 DGEMM。
                  *
-                 * 对每个64位字计算两个原子掩码的交集：
+                 * 本版本在遍历置位位时，将相邻的有效网格点合并成连续段。
                  *
-                 *     pair_word = mask1[iw] & mask2[iw]
+                 * 例如共同有效网格点为：
                  *
-                 * pair_word 中值为1的比特就是共同有效的网格点。
-                 * 每次使用 ctz64 找到最低置位比特，并通过：
+                 *     3, 4, 5, 6, 12, 13, 25
                  *
-                 *     pair_word &= pair_word - 1
+                 * 则识别为三个连续段：
                  *
-                 * 清除该置位比特。
+                 *     [3, 7)    run_length = 4
+                 *     [12, 14)  run_length = 2
+                 *     [25, 26)  run_length = 1
                  *
-                 * mask_words 按递增顺序遍历，每个字内部也始终先处理
-                 * 最低置位比特，所以有效网格点 ib 的处理顺序仍然严格递增，
-                 * 与原来从 first_ib 扫描到 last_ib 的调用顺序一致。
+                 * 原来需要7次 k=1 的 DGEMM，
+                 * 现在只需要3次 k=4、k=2、k=1 的 DGEMM。
+                 *
+                 * 转置布局中，同一条轨道在网格点方向连续存储，
+                 * 因此每个连续段可以直接作为 DGEMM 的 K 维输入，
+                 * 不需要 Gather、重新打包或中间结果矩阵。
+                 */
+
+                // 当前尚未提交的连续段起点。
+                int run_start = -1;
+
+                // 当前连续段包含的有效网格点数量。
+                int run_length = 0;
+
+                // 上一个有效网格点。初始值取 -2，使第一个有效点
+                // 不会被误判为与初始状态连续。
+                int previous_ib = -2;
+
+                /*
+                 * 提交一个已经完成识别的连续段。
+                 *
+                 * 对区间：
+                 *
+                 *     [current_run_start,
+                 *      current_run_start + current_run_length)
+                 *
+                 * 执行一次 K=current_run_length 的 DGEMM。
+                 *
+                 * beta 仍为1.0，所以不同连续段的结果会依次累加到
+                 * 同一个 tmp_matrix 中。
+                 */
+                const auto execute_run_gemm
+                    = [&](const int current_run_start,
+                          const int current_run_length)
+                {
+                    const double* const ptr_a
+                        = vlbr3_T.data()
+                        + base_a
+                        + current_run_start;
+
+                    const double* const ptr_b
+                        = ylm_T.data()
+                        + base_b
+                        + current_run_start;
+
+                    dgemm_(
+                        &transa,
+                        &transb,
+                        &n,
+                        &m,
+                        &current_run_length,
+                        &alpha,
+                        ptr_a,
+                        &ldt,
+                        ptr_b,
+                        &ldt,
+                        &beta,
+                        tmp_matrix->get_pointer(),
+                        &n);
+                };
+
+                /*
+                 * mask_words 按照从低到高的顺序遍历。
+                 * 每个64位字内部始终使用 ctz64 取出最低置位比特，
+                 * 因此得到的 ib 序列严格递增。
+                 *
+                 * 这种写法还能正确合并跨64位字边界的连续段，
+                 * 例如 ib=63 和 ib=64 会被识别为同一个连续段。
                  */
                 for (int iw = 0; iw < mask_words; ++iw)
                 {
@@ -564,41 +631,44 @@ void Gint::cal_meshball_vlocal(
                         const int ib
                             = iw * 64 + bit_index;
 
-                        const int k = 1;
+                        if (run_length == 0)
+                        {
+                            // 这是当前原子对遇到的第一个有效点，
+                            // 创建第一个连续段。
+                            run_start = ib;
+                            run_length = 1;
+                        }
+                        else if (ib == previous_ib + 1)
+                        {
+                            // 当前有效点紧邻上一个有效点，
+                            // 将其并入当前连续段。
+                            ++run_length;
+                        }
+                        else
+                        {
+                            // 当前有效点与上一个有效点不连续。
+                            // 先提交已经完成的连续段，再创建新连续段。
+                            execute_run_gemm(
+                                run_start,
+                                run_length);
 
-                        const double* const ptr_a
-                            = vlbr3_T.data()
-                            + base_a
-                            + ib;
+                            run_start = ib;
+                            run_length = 1;
+                        }
 
-                        const double* const ptr_b
-                            = ylm_T.data()
-                            + base_b
-                            + ib;
-
-                        /*
-                         * 保持原稀疏分支的计算方式：
-                         * 每个共同有效网格点仍执行一次 k=1 的 DGEMM，
-                         * 并直接累加到 tmp_matrix。
-                         */
-                        dgemm_(
-                            &transa,
-                            &transb,
-                            &n,
-                            &m,
-                            &k,
-                            &alpha,
-                            ptr_a,
-                            &ldt,
-                            ptr_b,
-                            &ldt,
-                            &beta,
-                            tmp_matrix->get_pointer(),
-                            &n);
+                        previous_ib = ib;
 
                         // 清除最低置位比特，继续处理下一个有效网格点。
                         pair_word &= pair_word - 1;
                     }
+                }
+
+                // 循环结束时，最后一个连续段尚未提交。
+                if (run_length > 0)
+                {
+                    execute_run_gemm(
+                        run_start,
+                        run_length);
                 }
             }
         }
