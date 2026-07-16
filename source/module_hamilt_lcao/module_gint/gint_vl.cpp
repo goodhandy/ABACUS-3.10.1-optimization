@@ -118,22 +118,17 @@ inline PreparedMaskCache& begin_prepare_mask_cache(
     const bool* const* const cal_flag,
     const int expected_uses)
 {
-    PreparedMaskCache& cache
-        = prepared_mask_cache;
+    PreparedMaskCache& cache = prepared_mask_cache;
 
     cache.na_grid = na_grid;
     cache.bxyz = bxyz;
-    cache.mask_words
-        = (bxyz + 63) / 64;
+    cache.mask_words = (bxyz + 63) / 64;
 
-    cache.cal_flag_identity
-        = cal_flag;
+    cache.cal_flag_identity = cal_flag;
 
-    cache.remaining_uses
-        = expected_uses;
+    cache.remaining_uses = expected_uses;
 
-    const std::size_t required_words
-        = static_cast<std::size_t>(na_grid)
+    const std::size_t required_words = static_cast<std::size_t>(na_grid)
         * cache.mask_words;
 
     if (cache.words.size() < required_words)
@@ -163,8 +158,7 @@ inline const std::uint64_t* try_acquire_prepared_masks(
     const int mask_words,
     const bool* const* const cal_flag)
 {
-    PreparedMaskCache& cache
-        = prepared_mask_cache;
+    PreparedMaskCache& cache = prepared_mask_cache;
 
     if (cache.remaining_uses <= 0
         || cache.na_grid != na_grid
@@ -223,8 +217,7 @@ inline void build_atom_masks(
     std::uint64_t* const atom_masks)
 {
     // 位掩码总字数 = 原子数 × 每个原子所需的64位字数。
-    const std::size_t total_words
-        = static_cast<std::size_t>(na_grid) * mask_words;
+    const std::size_t total_words = static_cast<std::size_t>(na_grid) * mask_words;
 
     // thread_local 缓冲区会在不同网格块之间复用，因此每次构造前
     // 必须将当前有效区域清零，避免残留上一个网格块的置位比特。
@@ -244,8 +237,7 @@ inline void build_atom_masks(
         const int bit_index = ib % 64;
 
         // 构造仅有第 bit_index 位为1的比特掩码。
-        const std::uint64_t bit
-            = std::uint64_t{1} << bit_index;
+        const std::uint64_t bit = std::uint64_t{1} << bit_index;
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
@@ -307,8 +299,7 @@ inline bool analyse_pair_mask(
     for (int iw = 0; iw < mask_words; ++iw)
     {
         // 按位与后，值为1的比特即两个原子共同有效的网格点。
-        const std::uint64_t intersection
-            = mask1[iw] & mask2[iw];
+        const std::uint64_t intersection = mask1[iw] & mask2[iw];
 
         // 当前64位范围内不存在共同有效点。
         if (intersection == 0)
@@ -344,18 +335,15 @@ inline bool analyse_pair_mask(
     // ctz 返回第一个非零交集字中最低置位比特的位置。
     // 加上该64位字在全局网格点序列中的起始偏移，
     // 得到第一个共同有效网格点 first_ib。
-    first_ib
-        = first_word * 64
+    first_ib = first_word * 64
         + ctz64(first_intersection);
 
     // clz 用于定位最后一个非零交集字中的最高置位比特。
-    const int highest_set_bit
-        = 63 - clz64(last_intersection);
+    const int highest_set_bit = 63 - clz64(last_intersection);
 
     // 保持与原代码一致，last_ib 使用半开区间右端点，
     // 即“最后一个有效网格点索引 + 1”。
-    last_ib
-        = last_word * 64
+    last_ib = last_word * 64
         + highest_set_bit
         + 1;
 
@@ -367,6 +355,52 @@ inline bool analyse_pair_mask(
 
 namespace GintVlocalFusion
 {
+
+/**
+ * @brief 转置一个普通面板，并在同一次 cal_flag 扫描中构造原子位掩码。
+ *
+ * 输入：src[ib][iorb]
+ * 输出：dst_T[iorb][ib]
+ *
+ * 普通 vlocal 先仅将 psir_ylm 转置为 psir_ylm_T，同时准备
+ * cal_meshball_vlocal 后续需要的原子位掩码。
+ */
+void build_transposed_panel_and_masks(
+    int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag,
+    const double* const* src, double* const* dst_T, int expected_mask_uses)
+{
+    PreparedMaskCache& cache =
+        begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
+
+    for (int ib = 0; ib < bxyz; ++ib)
+    {
+        const int word_index = ib / 64;
+        const std::uint64_t bit = std::uint64_t{1} << (ib % 64);
+        const double* src_row = src[ib];
+
+        for (int ia = 0; ia < na_grid; ++ia)
+        {
+            const int orbital_begin = block_index[ia];
+            const int orbital_end = block_index[ia + 1];
+
+            if (cal_flag[ib][ia])
+            {
+                cache.words[static_cast<std::size_t>(ia) * cache.mask_words + word_index] |= bit;
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
+                {
+                    dst_T[iorb][ib] = src_row[iorb];
+                }
+            }
+            else
+            {
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
+                {
+                    dst_T[iorb][ib] = 0.0;
+                }
+            }
+        }
+    }
+}
 
 /**
  * @brief 一次遍历同时生成两个转置面板和原子位掩码。
@@ -396,8 +430,7 @@ void build_two_transposed_panels_and_masks(
     double* const* const psir_left_T,
     const int expected_mask_uses)
 {
-    PreparedMaskCache& cache
-        = begin_prepare_mask_cache(
+    PreparedMaskCache& cache = begin_prepare_mask_cache(
             na_grid,
             bxyz,
             cal_flag,
@@ -405,34 +438,25 @@ void build_two_transposed_panels_and_masks(
 
     for (int ib = 0; ib < bxyz; ++ib)
     {
-        const int word_index
-            = ib / 64;
+        const int word_index = ib / 64;
 
-        const int bit_index
-            = ib % 64;
+        const int bit_index = ib % 64;
 
-        const std::uint64_t bit
-            = std::uint64_t{1} << bit_index;
+        const std::uint64_t bit = std::uint64_t{1} << bit_index;
 
-        const double* const right_src_row
-            = psir_right_source[ib];
+        const double* const right_src_row = psir_right_source[ib];
 
-        const double* const left_src_row
-            = psir_left_source[ib];
+        const double* const left_src_row = psir_left_source[ib];
 
-        const double scale_value
-            = scale[ib];
+        const double scale_value = scale[ib];
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
-            const int orbital_begin
-                = block_index[ia];
+            const int orbital_begin = block_index[ia];
 
-            const int orbital_end
-                = block_index[ia + 1];
+            const int orbital_end = block_index[ia + 1];
 
-            const bool active
-                = cal_flag[ib][ia];
+            const bool active = cal_flag[ib][ia];
 
             if (active)
             {
@@ -445,11 +469,9 @@ void build_two_transposed_panels_and_masks(
                      iorb < orbital_end;
                      ++iorb)
                 {
-                    psir_right_T[iorb][ib]
-                        = right_src_row[iorb];
+                    psir_right_T[iorb][ib] = right_src_row[iorb];
 
-                    psir_left_T[iorb][ib]
-                        = scale_value
+                    psir_left_T[iorb][ib] = scale_value
                         * left_src_row[iorb];
                 }
             }
@@ -483,8 +505,7 @@ void build_scaled_transposed_panel_and_masks(
     double* const* const dst_T,
     const int expected_mask_uses)
 {
-    PreparedMaskCache& cache
-        = begin_prepare_mask_cache(
+    PreparedMaskCache& cache = begin_prepare_mask_cache(
             na_grid,
             bxyz,
             cal_flag,
@@ -492,31 +513,23 @@ void build_scaled_transposed_panel_and_masks(
 
     for (int ib = 0; ib < bxyz; ++ib)
     {
-        const int word_index
-            = ib / 64;
+        const int word_index = ib / 64;
 
-        const int bit_index
-            = ib % 64;
+        const int bit_index = ib % 64;
 
-        const std::uint64_t bit
-            = std::uint64_t{1} << bit_index;
+        const std::uint64_t bit = std::uint64_t{1} << bit_index;
 
-        const double* const src_row
-            = src[ib];
+        const double* const src_row = src[ib];
 
-        const double scale_value
-            = scale[ib];
+        const double scale_value = scale[ib];
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
-            const int orbital_begin
-                = block_index[ia];
+            const int orbital_begin = block_index[ia];
 
-            const int orbital_end
-                = block_index[ia + 1];
+            const int orbital_end = block_index[ia + 1];
 
-            const bool active
-                = cal_flag[ib][ia];
+            const bool active = cal_flag[ib][ia];
 
             if (active)
             {
@@ -529,8 +542,7 @@ void build_scaled_transposed_panel_and_masks(
                      iorb < orbital_end;
                      ++iorb)
                 {
-                    dst_T[iorb][ib]
-                        = scale_value
+                    dst_T[iorb][ib] = scale_value
                         * src_row[iorb];
                 }
             }
@@ -588,11 +600,9 @@ void Gint::cal_meshball_vlocal(
     // ---------------------------------------------------------------------
     // 第二步：优先复用上层面板生成阶段同步构造的位掩码
     // ---------------------------------------------------------------------
-    const int mask_words
-        = (bxyz_local + 63) / 64;
+    const int mask_words = (bxyz_local + 63) / 64;
 
-    const std::uint64_t* atom_masks_ptr
-        = try_acquire_prepared_masks(
+    const std::uint64_t* atom_masks_ptr = try_acquire_prepared_masks(
             na_grid,
             bxyz_local,
             mask_words,
@@ -609,8 +619,7 @@ void Gint::cal_meshball_vlocal(
 
     if (atom_masks_ptr == nullptr)
     {
-        const std::size_t required_mask_words
-            = static_cast<std::size_t>(na_grid)
+        const std::size_t required_mask_words = static_cast<std::size_t>(na_grid)
             * mask_words;
 
         if (fallback_atom_masks.size()
@@ -627,8 +636,7 @@ void Gint::cal_meshball_vlocal(
             cal_flag,
             fallback_atom_masks.data());
 
-        atom_masks_ptr
-            = fallback_atom_masks.data();
+        atom_masks_ptr = fallback_atom_masks.data();
     }
 
     // ---------------------------------------------------------------------
@@ -639,21 +647,18 @@ void Gint::cal_meshball_vlocal(
     const double alpha = 1.0;
     const double beta = 1.0;
 
-    const int mcell_index
-        = this->gridt->bcell_start[grid_index];
+    const int mcell_index = this->gridt->bcell_start[grid_index];
 
     for (int ia1 = 0; ia1 < na_grid; ++ia1)
     {
         const int bcell1 = mcell_index + ia1;
         const int iat1 = this->gridt->which_atom[bcell1];
         const int id1 = this->gridt->which_unitcell[bcell1];
-        const ModuleBase::Vector3<int> r1
-            = this->gridt->get_ucell_coords(id1);
+        const ModuleBase::Vector3<int> r1 = this->gridt->get_ucell_coords(id1);
 
         // 当前原子 ia1 的位掩码起始地址。
         // mask1[0...mask_words-1] 表示该原子的全部网格点有效性。
-        const std::uint64_t* const mask1
-            = atom_masks_ptr
+        const std::uint64_t* const mask1 = atom_masks_ptr
             + static_cast<std::size_t>(ia1) * mask_words;
 
         for (int ia2 = 0; ia2 < na_grid; ++ia2)
@@ -661,8 +666,7 @@ void Gint::cal_meshball_vlocal(
             const int bcell2 = mcell_index + ia2;
             const int iat2 = this->gridt->which_atom[bcell2];
             const int id2 = this->gridt->which_unitcell[bcell2];
-            const ModuleBase::Vector3<int> r2
-                = this->gridt->get_ucell_coords(id2);
+            const ModuleBase::Vector3<int> r2 = this->gridt->get_ucell_coords(id2);
 
             if (iat1 > iat2)
             {
@@ -670,8 +674,7 @@ void Gint::cal_meshball_vlocal(
             }
 
             // 当前原子 ia2 的位掩码起始地址。
-            const std::uint64_t* const mask2
-                = atom_masks_ptr
+            const std::uint64_t* const mask2 = atom_masks_ptr
                 + static_cast<std::size_t>(ia2) * mask_words;
 
             int first_ib = 0;
@@ -685,8 +688,7 @@ void Gint::cal_meshball_vlocal(
             // 4. 有效网格点总数。
             //
             // 这替代了原代码针对每个原子对的多次 cal_flag 扫描。
-            const bool has_overlap
-                = analyse_pair_mask(
+            const bool has_overlap = analyse_pair_mask(
                     mask1,
                     mask2,
                     mask_words,
@@ -699,11 +701,9 @@ void Gint::cal_meshball_vlocal(
                 continue;
             }
 
-            const int ib_length
-                = last_ib - first_ib;
+            const int ib_length = last_ib - first_ib;
 
-            const auto tmp_matrix
-                = hR->find_matrix(
+            const auto tmp_matrix = hR->find_matrix(
                     iat1,
                     iat2,
                     r1 - r2);
@@ -713,19 +713,15 @@ void Gint::cal_meshball_vlocal(
                 continue;
             }
 
-            const int m
-                = tmp_matrix->get_row_size();
+            const int m = tmp_matrix->get_row_size();
 
-            const int n
-                = tmp_matrix->get_col_size();
+            const int n = tmp_matrix->get_col_size();
 
             // 两个输入均已经是 [LD_pool][bxyz] 布局。
             // block_index 直接定位相应原子的第一条轨道行。
-            const double* const left_block
-                = psir_left_T[block_index[ia2]];
+            const double* const left_block = psir_left_T[block_index[ia2]];
 
-            const double* const right_block
-                = psir_right_T[block_index[ia1]];
+            const double* const right_block = psir_right_T[block_index[ia1]];
 
             // 完全保留原代码的稀疏/稠密判断条件。
             //
@@ -734,12 +730,10 @@ void Gint::cal_meshball_vlocal(
             if (cal_pair_num > ib_length / 4)
             {
                 // 稠密分支：一次 DGEMM 计算整个首尾区间。
-                const double* const ptr_a
-                    = left_block
+                const double* const ptr_a = left_block
                     + first_ib;
 
-                const double* const ptr_b
-                    = right_block
+                const double* const ptr_b = right_block
                     + first_ib;
 
                 dgemm_(
@@ -782,27 +776,22 @@ void Gint::cal_meshball_vlocal(
                  */
                 for (int iw = 0; iw < mask_words; ++iw)
                 {
-                    std::uint64_t pair_word
-                        = mask1[iw] & mask2[iw];
+                    std::uint64_t pair_word = mask1[iw] & mask2[iw];
 
                     while (pair_word != 0)
                     {
                         // 找到当前64位字中最低的置位比特。
-                        const int bit_index
-                            = ctz64(pair_word);
+                        const int bit_index = ctz64(pair_word);
 
                         // 转换为当前网格块中的全局网格点编号。
-                        const int ib
-                            = iw * 64 + bit_index;
+                        const int ib = iw * 64 + bit_index;
 
                         const int k = 1;
 
-                        const double* const ptr_a
-                            = left_block
+                        const double* const ptr_a = left_block
                             + ib;
 
-                        const double* const ptr_b
-                            = right_block
+                        const double* const ptr_b = right_block
                             + ib;
 
                         /*

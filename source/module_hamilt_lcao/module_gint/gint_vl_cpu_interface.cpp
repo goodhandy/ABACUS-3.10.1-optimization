@@ -13,6 +13,10 @@
 namespace GintVlocalFusion
 {
 
+void build_transposed_panel_and_masks(
+    int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag,
+    const double* const* src, double* const* dst_T, int expected_mask_uses);
+
 void build_two_transposed_panels_and_masks(
     int bxyz,
     int na_grid,
@@ -39,6 +43,28 @@ void build_scaled_transposed_panel_and_masks(
 
 namespace
 {
+
+/**
+ * @brief 从已转置面板生成缩放后的转置面板。
+ *
+ * src_T 和 dst_T 均为 [LD_pool][bxyz]。src_T 的无效位置已经由
+ * build_transposed_panel_and_masks 写为0，因此这里无需再次判断 cal_flag。
+ */
+inline void build_scaled_panel_from_transposed(
+    int bxyz, int LD_pool, const double* scale,
+    const double* const* src_T, double* const* dst_T)
+{
+    for (int iorb = 0; iorb < LD_pool; ++iorb)
+    {
+        const double* src_row = src_T[iorb];
+        double* dst_row = dst_T[iorb];
+
+        for (int ib = 0; ib < bxyz; ++ib)
+        {
+            dst_row[ib] = scale[ib] * src_row[ib];
+        }
+    }
+}
 
 /**
  * @brief 在一次遍历中同时生成右转置面板和左转置面板。
@@ -79,22 +105,17 @@ inline void build_two_transposed_panels_without_masks(
      */
     for (int ib = 0; ib < bxyz; ++ib)
     {
-        const double* const right_src_row
-            = psir_right_source[ib];
+        const double* const right_src_row = psir_right_source[ib];
 
-        const double* const left_src_row
-            = psir_left_source[ib];
+        const double* const left_src_row = psir_left_source[ib];
 
-        const double scale_value
-            = scale[ib];
+        const double scale_value = scale[ib];
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
-            const int orbital_begin
-                = block_index[ia];
+            const int orbital_begin = block_index[ia];
 
-            const int orbital_end
-                = block_index[ia + 1];
+            const int orbital_end = block_index[ia + 1];
 
             if (cal_flag[ib][ia])
             {
@@ -102,11 +123,9 @@ inline void build_two_transposed_panels_without_masks(
                      iorb < orbital_end;
                      ++iorb)
                 {
-                    psir_right_T[iorb][ib]
-                        = right_src_row[iorb];
+                    psir_right_T[iorb][ib] = right_src_row[iorb];
 
-                    psir_left_T[iorb][ib]
-                        = scale_value
+                    psir_left_T[iorb][ib] = scale_value
                         * left_src_row[iorb];
                 }
             }
@@ -141,16 +160,13 @@ inline void build_transposed_panel(
 {
     for (int ib = 0; ib < bxyz; ++ib)
     {
-        const double* const src_row
-            = src[ib];
+        const double* const src_row = src[ib];
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
-            const int orbital_begin
-                = block_index[ia];
+            const int orbital_begin = block_index[ia];
 
-            const int orbital_end
-                = block_index[ia + 1];
+            const int orbital_end = block_index[ia + 1];
 
             if (cal_flag[ib][ia])
             {
@@ -158,8 +174,7 @@ inline void build_transposed_panel(
                      iorb < orbital_end;
                      ++iorb)
                 {
-                    dst_T[iorb][ib]
-                        = src_row[iorb];
+                    dst_T[iorb][ib] = src_row[iorb];
                 }
             }
             else
@@ -194,19 +209,15 @@ inline void build_scaled_transposed_panel(
 {
     for (int ib = 0; ib < bxyz; ++ib)
     {
-        const double* const src_row
-            = src[ib];
+        const double* const src_row = src[ib];
 
-        const double scale_value
-            = scale[ib];
+        const double scale_value = scale[ib];
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
-            const int orbital_begin
-                = block_index[ia];
+            const int orbital_begin = block_index[ia];
 
-            const int orbital_end
-                = block_index[ia + 1];
+            const int orbital_end = block_index[ia + 1];
 
             if (cal_flag[ib][ia])
             {
@@ -214,8 +225,7 @@ inline void build_scaled_transposed_panel(
                      iorb < orbital_end;
                      ++iorb)
                 {
-                    dst_T[iorb][ib]
-                        = scale_value
+                    dst_T[iorb][ib] = scale_value
                         * src_row[iorb];
                 }
             }
@@ -250,26 +260,19 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
         "Handy_Test",
         "test_cal_gint_vlocal");
 
-    const UnitCell& ucell
-        = *this->ucell;
+    const UnitCell& ucell = *this->ucell;
 
-    const int max_size
-        = this->gridt->max_atom;
+    const int max_size = this->gridt->max_atom;
 
-    const int lgd
-        = this->gridt->lgd;
+    const int lgd = this->gridt->lgd;
 
-    const int ncyz
-        = this->ny * this->nplane;
+    const int ncyz = this->ny * this->nplane;
 
-    const double dv
-        = ucell.omega / this->ncxyz;
+    const double dv = ucell.omega / this->ncxyz;
 
-    const double delta_r
-        = this->gridt->dr_uniform;
+    const double delta_r = this->gridt->dr_uniform;
 
-    hamilt::HContainer<double>* hRGint_kernel
-        = PARAM.inp.nspin != 4
+    hamilt::HContainer<double>* hRGint_kernel = PARAM.inp.nspin != 4
         ? this->hRGint
         : this->hRGint_tmp[inout->ispin];
 
@@ -313,8 +316,7 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
              grid_index < this->nbxx;
              ++grid_index)
         {
-            const int na_grid
-                = this->gridt
+            const int na_grid = this->gridt
                       ->how_many_atoms[grid_index];
 
             if (na_grid == 0)
@@ -325,8 +327,7 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
             // -------------------------------------------------------------
             // A. 网格块准备
             // -------------------------------------------------------------
-            t_start
-                = std::chrono::steady_clock::now();
+            t_start = std::chrono::steady_clock::now();
 
             ModuleBase::Array_Pool<bool>
                 cal_flag(this->bxyz, max_size);
@@ -354,124 +355,86 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
                 block_size.data(),
                 cal_flag.get_ptr_2D());
 
-            const int LD_pool
-                = block_index[na_grid];
+            const int LD_pool = block_index[na_grid];
 
             ModuleBase::Array_Pool<double>
                 psir_ylm(
                     this->bxyz,
                     LD_pool);
 
-            t_end
-                = std::chrono::steady_clock::now();
+            t_end = std::chrono::steady_clock::now();
 
-            thread_time_prep
-                += std::chrono::duration<double>(
+            thread_time_prep += std::chrono::duration<double>(
                     t_end - t_start).count();
 
             // -------------------------------------------------------------
             // B. 基函数计算
             // -------------------------------------------------------------
-            t_start
-                = std::chrono::steady_clock::now();
+            t_start = std::chrono::steady_clock::now();
 
-            Gint_Tools::cal_psir_ylm(
-                *this->gridt,
-                this->bxyz,
-                na_grid,
-                grid_index,
-                delta_r,
-                block_index.data(),
-                block_size.data(),
-                cal_flag.get_ptr_2D(),
-                psir_ylm.get_ptr_2D());
+            Gint_Tools::cal_psir_ylm(*this->gridt, this->bxyz, na_grid, grid_index, delta_r,
+                                     block_index.data(), block_size.data(), cal_flag.get_ptr_2D(),
+                                     psir_ylm.get_ptr_2D());
 
-            const ModuleBase::Array_Pool<double>&
-                psir_ylm_1
-                = (!this->psir_func_1)
-                ? psir_ylm
-                : this->psir_func_1(
-                      psir_ylm,
-                      *this->gridt,
-                      grid_index,
-                      0,
-                      block_iw,
-                      block_size,
-                      block_index,
-                      cal_flag);
-
-            const ModuleBase::Array_Pool<double>&
-                psir_ylm_2
-                = (!this->psir_func_2)
-                ? psir_ylm
-                : this->psir_func_2(
-                      psir_ylm,
-                      *this->gridt,
-                      grid_index,
-                      0,
-                      block_iw,
-                      block_size,
-                      block_index,
-                      cal_flag);
-
-            t_end
-                = std::chrono::steady_clock::now();
-
-            thread_time_psir
-                += std::chrono::duration<double>(
-                    t_end - t_start).count();
-
-            // -------------------------------------------------------------
-            // C1. 一次遍历同时生成两个转置面板
-            // -------------------------------------------------------------
-            t_start
-                = std::chrono::steady_clock::now();
-
-            ModuleBase::Array_Pool<double>
-                psir_right_T(
-                    LD_pool,
-                    this->bxyz);
-
-            ModuleBase::Array_Pool<double>
-                psir_vlbr3_T(
-                    LD_pool,
-                    this->bxyz);
-
-            /*
-             * 保持当前上传代码的调用语义：
-             *
-             * 右面板来自 psir_ylm；
-             * 左面板来自 psir_ylm_1，并乘以 vldr3。
-             *
-             * psir_ylm_2 的计算仍然保留，但本轮实验不改变右侧来源。
-             */
+            // 保留原代码对 psir_func_2 的求值语义；当前 vlocal 收缩仍不使用其结果。
+            const ModuleBase::Array_Pool<double>& psir_ylm_2 =
+                (!this->psir_func_2)
+                    ? psir_ylm
+                    : this->psir_func_2(psir_ylm, *this->gridt, grid_index, 0, block_iw,
+                                        block_size, block_index, cal_flag);
             (void)psir_ylm_2;
 
-            GintVlocalFusion::
-                build_two_transposed_panels_and_masks(
-                    this->bxyz,
-                    na_grid,
-                    block_index.data(),
-                    cal_flag.get_ptr_2D(),
-                    vldr3.data(),
-                    psir_ylm.get_ptr_2D(),
-                    psir_ylm_1.get_ptr_2D(),
-                    psir_right_T.get_ptr_2D(),
-                    psir_vlbr3_T.get_ptr_2D(),
-                    1);
+            t_end = std::chrono::steady_clock::now();
+            thread_time_psir += std::chrono::duration<double>(t_end - t_start).count();
 
-            t_end
-                = std::chrono::steady_clock::now();
+            // -------------------------------------------------------------
+            // C1. 同源使用两阶段；不同源使用原双源单循环
+            // -------------------------------------------------------------
+            t_start = std::chrono::steady_clock::now();
 
-            thread_time_panels
-                += std::chrono::duration<double>(
-                    t_end - t_start).count();
+            ModuleBase::Array_Pool<double> psir_ylm_T(LD_pool, this->bxyz);
+            ModuleBase::Array_Pool<double> psir_vlbr3_T(LD_pool, this->bxyz);
+
+            if (!this->psir_func_1)
+            {
+                /*
+                 * 同源路径：
+                 * 第一阶段只转置 psir_ylm，并同步构造原子位掩码；
+                 * 第二阶段沿 ib 连续读取 psir_ylm_T，连续写入 psir_vlbr3_T。
+                 */
+                GintVlocalFusion::build_transposed_panel_and_masks(
+                    this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(),
+                    psir_ylm.get_ptr_2D(), psir_ylm_T.get_ptr_2D(), 1);
+
+                build_scaled_panel_from_transposed(this->bxyz, LD_pool, vldr3.data(),
+                                                   psir_ylm_T.get_ptr_2D(),
+                                                   psir_vlbr3_T.get_ptr_2D());
+            }
+            else
+            {
+                /*
+                 * 不同源路径：
+                 * psir_ylm_T 来自基础 psir_ylm；
+                 * psir_vlbr3_T 来自 vldr3 * psir_ylm_1；
+                 * 两个最终面板仍在一次 ib-ia-iorb 遍历中生成，不额外保存变换源的转置副本。
+                 */
+                const ModuleBase::Array_Pool<double>& psir_ylm_1 =
+                    this->psir_func_1(psir_ylm, *this->gridt, grid_index, 0, block_iw,
+                                      block_size, block_index, cal_flag);
+
+                GintVlocalFusion::build_two_transposed_panels_and_masks(
+                    this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(),
+                    vldr3.data(), psir_ylm.get_ptr_2D(), psir_ylm_1.get_ptr_2D(),
+                    psir_ylm_T.get_ptr_2D(), psir_vlbr3_T.get_ptr_2D(), 1);
+            }
+
+            t_end = std::chrono::steady_clock::now();
+            thread_time_panels += std::chrono::duration<double>(t_end - t_start).count();
 
             // -------------------------------------------------------------
             // C2. 直接消费两个转置面板完成收缩
             // -------------------------------------------------------------
-            t_start
-                = std::chrono::steady_clock::now();
+            t_start = std::chrono::steady_clock::now();
 
             ModuleBase::timer::tick(
                 "Handy_Test",
@@ -484,7 +447,7 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
                 block_index.data(),
                 grid_index,
                 cal_flag.get_ptr_2D(),
-                psir_right_T.get_ptr_2D(),
+                psir_ylm_T.get_ptr_2D(),
                 psir_vlbr3_T.get_ptr_2D(),
                 &hRGint_thread);
 
@@ -492,11 +455,9 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
                 "Handy_Test",
                 "cal_meshball_vlocal");
 
-            t_end
-                = std::chrono::steady_clock::now();
+            t_end = std::chrono::steady_clock::now();
 
-            thread_time_meshball
-                += std::chrono::duration<double>(
+            thread_time_meshball += std::chrono::duration<double>(
                     t_end - t_start).count();
         }
 
@@ -510,17 +471,13 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
                 hRGint_kernel->get_wrapper(),
                 1);
 
-            total_time_prep
-                += thread_time_prep;
+            total_time_prep += thread_time_prep;
 
-            total_time_psir
-                += thread_time_psir;
+            total_time_psir += thread_time_psir;
 
-            total_time_panels
-                += thread_time_panels;
+            total_time_panels += thread_time_panels;
 
-            total_time_meshball
-                += thread_time_meshball;
+            total_time_meshball += thread_time_meshball;
         }
     }
 
@@ -558,27 +515,20 @@ void Gint::gint_kernel_dvlocal(Gint_inout* inout)
         "Gint_interface",
         "cal_gint_dvlocal");
 
-    const UnitCell& ucell
-        = *this->ucell;
+    const UnitCell& ucell = *this->ucell;
 
-    const int max_size
-        = this->gridt->max_atom;
+    const int max_size = this->gridt->max_atom;
 
-    const int lgd
-        = this->gridt->lgd;
+    const int lgd = this->gridt->lgd;
 
-    const int nnrg
-        = pvdpRx_reduced[
+    const int nnrg = pvdpRx_reduced[
               inout->ispin].get_nnr();
 
-    const int ncyz
-        = this->ny * this->nplane;
+    const int ncyz = this->ny * this->nplane;
 
-    const double dv
-        = ucell.omega / this->ncxyz;
+    const double dv = ucell.omega / this->ncxyz;
 
-    const double delta_r
-        = this->gridt->dr_uniform;
+    const double delta_r = this->gridt->dr_uniform;
 
     (void)lgd;
 
@@ -632,8 +582,7 @@ void Gint::gint_kernel_dvlocal(Gint_inout* inout)
              grid_index < this->nbxx;
              ++grid_index)
         {
-            const int na_grid
-                = this->gridt
+            const int na_grid = this->gridt
                       ->how_many_atoms[grid_index];
 
             if (na_grid == 0)
@@ -669,8 +618,7 @@ void Gint::gint_kernel_dvlocal(Gint_inout* inout)
                 block_size.data(),
                 cal_flag.get_ptr_2D());
 
-            const int LD_pool
-                = block_index[na_grid];
+            const int LD_pool = block_index[na_grid];
 
             ModuleBase::Array_Pool<double>
                 psir_ylm(
@@ -869,33 +817,25 @@ void Gint::gint_kernel_vlocal_meta(
         "Gint_interface",
         "cal_gint_vlocal_meta");
 
-    const UnitCell& ucell
-        = *this->ucell;
+    const UnitCell& ucell = *this->ucell;
 
-    const int max_size
-        = this->gridt->max_atom;
+    const int max_size = this->gridt->max_atom;
 
-    const int lgd
-        = this->gridt->lgd;
+    const int lgd = this->gridt->lgd;
 
-    const int ncyz
-        = this->ny * this->nplane;
+    const int ncyz = this->ny * this->nplane;
 
-    const double dv
-        = ucell.omega / this->ncxyz;
+    const double dv = ucell.omega / this->ncxyz;
 
-    const double delta_r
-        = this->gridt->dr_uniform;
+    const double delta_r = this->gridt->dr_uniform;
 
-    hamilt::HContainer<double>* hRGint_kernel
-        = PARAM.inp.nspin != 4
+    hamilt::HContainer<double>* hRGint_kernel = PARAM.inp.nspin != 4
         ? this->hRGint
         : this->hRGint_tmp[inout->ispin];
 
     hRGint_kernel->set_zero();
 
-    const int nnrg
-        = hRGint_kernel->get_nnr();
+    const int nnrg = hRGint_kernel->get_nnr();
 
     (void)lgd;
 
@@ -925,8 +865,7 @@ void Gint::gint_kernel_vlocal_meta(
              grid_index < this->nbxx;
              ++grid_index)
         {
-            const int na_grid
-                = this->gridt
+            const int na_grid = this->gridt
                       ->how_many_atoms[grid_index];
 
             if (na_grid == 0)
@@ -975,8 +914,7 @@ void Gint::gint_kernel_vlocal_meta(
                 block_size.data(),
                 cal_flag.get_ptr_2D());
 
-            const int LD_pool
-                = block_index[na_grid];
+            const int LD_pool = block_index[na_grid];
 
             ModuleBase::Array_Pool<double>
                 psir_ylm(
