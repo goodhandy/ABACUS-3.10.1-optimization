@@ -26,75 +26,75 @@ void Gint::cal_meshball_vlocal(
     const double*const*const psir_vlbr3, hamilt::HContainer<double>* hR)             
 {
     // ========================================================================
-    // 局部即时转置 
-    // 在进入原子循环前，将 [bxyz][LD_pool] 重排为的 [LD_pool][bxyz]
+    // 局部即时转置：构建绝对连续的 [LD_pool][bxyz] 内存结构
     // ========================================================================
     thread_local std::vector<double> vlbr3_T;
     thread_local std::vector<double> ylm_T;
-    const int total_size = this->bxyz * LD_pool;
+    const int bxyz_local = this->bxyz; 
+    const int total_size = bxyz_local * LD_pool;
+    
     if (vlbr3_T.size() < total_size) {
-        vlbr3_T.resize(total_size);
-        ylm_T.resize(total_size);
+        vlbr3_T.resize(total_size, 0.0);
+        ylm_T.resize(total_size, 0.0);
     }
 
-    
-    for (int ib = 0; ib < this->bxyz; ++ib) {
-        for (int iorb = 0; iorb < LD_pool; ++iorb) {
-            vlbr3_T[iorb * this->bxyz + ib] = psir_vlbr3[ib][iorb];
-            ylm_T[iorb * this->bxyz + ib]   = psir_ylm[ib][iorb];
+    // 纯二维转置，轨道在外，网格在内，保障内存连续写入速度
+    for (int iorb = 0; iorb < LD_pool; ++iorb) {
+        for (int ib = 0; ib < bxyz_local; ++ib) {
+            vlbr3_T[iorb * bxyz_local + ib] = psir_vlbr3[ib][iorb];
+            ylm_T[iorb * bxyz_local + ib]   = psir_ylm[ib][iorb];
         }
     }
-    // ========================================================================
 
-    // 正如你推演的，因为现在送给 Fortran 的内存变成了转置结构
-    // 物理公式 C = B^T * A，在 Fortran 视角的 C_F = A_F_new^T * B_F_new 中
-    // 我们必须将参数对调：transa='T', transb='N'
-    const char transa='T', transb='N'; 
-    const double alpha=1, beta=1;
-    // 你的绝杀：跨步步长现在绝对等于 bxyz！
-    const int LDA = this->bxyz; 
+    // ========================================================================
+    // 暴力稠密计算区 (Dense Tensor Computation)
+    // 放弃寻找稀疏边界，一切皆为连续的宏观矩阵运算
+    // ========================================================================
+    const char transa = 'T', transb = 'N'; 
+    const double alpha = 1.0, beta = 1.0;
+    
+    // 你的绝杀 1：K 永远等于满编的 bxyz，没有任何截断
+    const int K = bxyz_local; 
+    // 你的绝杀 2：虽然 K 连满了，但换列的物理距离依然是轨道的长度 bxyz
+    const int LDA = bxyz_local; 
 
     const int mcell_index = this->gridt->bcell_start[grid_index];
-    for(int ia1=0; ia1<na_grid; ++ia1)
+    for(int ia1 = 0; ia1 < na_grid; ++ia1)
     {
         const int bcell1 = mcell_index + ia1;
         const int iat1 = this->gridt->which_atom[bcell1];
         const int id1 = this->gridt->which_unitcell[bcell1];
         const ModuleBase::Vector3<int> r1 = this->gridt->get_ucell_coords(id1);
+        
+        // 提取寻址常数
+        const int ia1_base_offset = block_index[ia1] * bxyz_local;
 
-        for(int ia2=0; ia2<na_grid; ++ia2)
+        for(int ia2 = 0; ia2 < na_grid; ++ia2)
         {
             const int bcell2 = mcell_index + ia2;
-            const int iat2= this->gridt->which_atom[bcell2];
+            const int iat2 = this->gridt->which_atom[bcell2];
             const int id2 = this->gridt->which_unitcell[bcell2];
             const ModuleBase::Vector3<int> r2 = this->gridt->get_ucell_coords(id2);
 
-            if(iat1<=iat2)
+            // 物理对称性
+            if(iat1 <= iat2)
             {
-                // 找出网格有效边界
-                int first_ib=0, last_ib=0;
-                for(int ib=0; ib<this->bxyz; ++ib) {
-                    if(cal_flag[ib][ia1] && cal_flag[ib][ia2]) { first_ib=ib; break; }
-                }
-                for(int ib=this->bxyz-1; ib>=0; --ib) {
-                    if(cal_flag[ib][ia1] && cal_flag[ib][ia2]) { last_ib=ib+1; break; }
-                }
-                const int ib_length = last_ib-first_ib;
-                if(ib_length<=0) continue;
-
+                // 我们不再遍历 cal_flag 去找边界！
+                // 直接寻找全局哈密顿量矩阵指针
                 const auto tmp_matrix = hR->find_matrix(iat1, iat2, r1-r2);
+                
+                // 周期性边界条件下，如果这两个原子完全没有相互作用，矩阵指针会为空
                 if (tmp_matrix == nullptr) continue;
+                
                 const int m = tmp_matrix->get_row_size();
                 const int n = tmp_matrix->get_col_size();
 
-                // 获取原子在 [LD_pool][bxyz] 新结构中的首地址指针
-                // 注意：现在的基址偏移是 轨道索引(block_index) * 轨道长度(bxyz) + 网格起始点(first_ib)
-                const double* ptr_A = &vlbr3_T[block_index[ia2] * this->bxyz + first_ib];
-                const double* ptr_B = &ylm_T[block_index[ia1] * this->bxyz + first_ib];
+                // 获取目标矩阵的首地址
+                const double* ptr_A = vlbr3_T.data() + block_index[ia2] * bxyz_local;
+                const double* ptr_B = ylm_T.data()   + ia1_base_offset;
 
-                // 为了发挥 0 间隙读取的最大威力，我们废弃稀疏分支，统一采用密集计算
-                // 直接向 dgemm_ 灌入这片完美连续的内存！
-                dgemm_(&transa, &transb, &n, &m, &ib_length, &alpha,
+                // 纯粹的暴力计算：抛弃所有分支判断，把全长 bxyz 直接拍给 CPU！
+                dgemm_(&transa, &transb, &n, &m, &K, &alpha,
                     ptr_A, &LDA, 
                     ptr_B, &LDA, 
                     &beta, tmp_matrix->get_pointer(), &n); 
