@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -13,15 +14,27 @@
 namespace GintVlocalFusion
 {
 
-void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag,
-    const double* scale, const double* const* src, double* const* psir_right_T, double* const* psir_left_T, int expected_mask_uses);
+void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                                                   const bool* const* cal_flag, const double* scale,
+                                                   const double* src, double* right_T, double* left_T,
+                                                   int expected_mask_uses);
 
-void build_two_transposed_panels_and_masks(int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag, const double* scale,
-    const double* const* psir_right_source, const double* const* psir_left_source, double* const* psir_right_T, double* const* psir_left_T,
-    int expected_mask_uses);
+void build_two_source_transposed_panels_and_masks(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                                                  const bool* const* cal_flag, const double* scale,
+                                                  const double* right_src, const double* left_src,
+                                                  double* right_T, double* left_T, int expected_mask_uses);
 
-void build_scaled_transposed_panel_and_masks(int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag,
-    const double* scale, const double* const* src, double* const* dst_T, int expected_mask_uses);
+void build_scaled_transposed_panel_and_masks(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                                             const bool* const* cal_flag, const double* scale,
+                                             const double* src, double* dst_T, int expected_mask_uses);
+
+void build_transposed_panel(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                            const bool* const* cal_flag, const double* src, double* dst_T);
+
+void build_same_source_transposed_panels_without_masks(int bxyz, int na_grid, int LD_pool,
+                                                       const int* block_index, const bool* const* cal_flag,
+                                                       const double* scale, const double* src,
+                                                       double* right_T, double* left_T);
 
 } // namespace GintVlocalFusion
 
@@ -29,162 +42,69 @@ namespace
 {
 
 /**
- * @brief 在一次遍历中同时生成右转置面板和左转置面板。
+ * @brief 每个 OpenMP 线程复用的两个扁平转置面板工作区。
  *
- * 输入布局：
- *
- *     psir_right_source[ib][iorb]
- *     psir_left_source [ib][iorb]
- *
- * 输出布局：
- *
- *     psir_right_T[iorb][ib]
- *         = psir_right_source[ib][iorb]
- *
- *     psir_left_T[iorb][ib]
- *         = scale[ib] * psir_left_source[ib][iorb]
- *
- * 两个输出的逻辑形状均为 [LD_pool][bxyz]，可以直接传入
- * cal_meshball_vlocal，不再需要在收缩函数内部执行显式转置。
- *
- * 对 cal_flag[ib][ia] 为 false 的原子轨道块显式写0，保证稠密
- * DGEMM 在首尾区间中计算空洞位置时仍保持原来的数值语义。
+ * 使用普通 std::vector，不指定额外对齐，也不填充行距。每条轨道行
+ * 的实际长度固定为 bxyz。行指针表仅用于兼容 cal_meshball_vlocal
+ * 的现有二维指针接口，转置热循环仍直接使用扁平连续缓冲区。
  */
-inline void build_two_transposed_panels_without_masks(const int bxyz, const int na_grid, const int* const block_index,
-    const bool* const* const cal_flag, const double* const scale, const double* const* const psir_right_source,
-    const double* const* const psir_left_source, double* const* const psir_right_T, double* const* const psir_left_T)
+class TransposedPanelWorkspace
 {
-    /*
-     * ib 为外层循环，使两个源矩阵均沿轨道方向连续读取。
-     * 每个原子—网格点组合只判断一次 cal_flag。
-     */
-    for (int ib = 0; ib < bxyz; ++ib)
+public:
+    void prepare(int orbital_rows, int bxyz)
     {
-        const double* const right_src_row = psir_right_source[ib];
+        rows_ = orbital_rows;
+        bxyz_ = bxyz;
+        const std::size_t required = static_cast<std::size_t>(rows_) * bxyz_;
 
-        const double* const left_src_row = psir_left_source[ib];
-
-        const double scale_value = scale[ib];
-
-        for (int ia = 0; ia < na_grid; ++ia)
+        if (first_.size() < required)
         {
-            const int orbital_begin = block_index[ia];
+            first_.resize(required);
+        }
 
-            const int orbital_end = block_index[ia + 1];
+        if (second_.size() < required)
+        {
+            second_.resize(required);
+        }
 
-            if (cal_flag[ib][ia])
-            {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
-                {
-                    psir_right_T[iorb][ib] = right_src_row[iorb];
+        first_rows_.resize(rows_);
+        second_rows_.resize(rows_);
 
-                    psir_left_T[iorb][ib] = scale_value
-                        * left_src_row[iorb];
-                }
-            }
-            else
-            {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
-                {
-                    psir_right_T[iorb][ib] = 0.0;
-                    psir_left_T[iorb][ib] = 0.0;
-                }
-            }
+        for (int iorb = 0; iorb < rows_; ++iorb)
+        {
+            first_rows_[iorb] = first_.data() + static_cast<std::size_t>(iorb) * bxyz_;
+            second_rows_[iorb] = second_.data() + static_cast<std::size_t>(iorb) * bxyz_;
         }
     }
-}
 
-/**
- * @brief 生成一个带 cal_flag 遮罩的普通转置面板。
- *
- * 输出：
- *
- *     dst_T[iorb][ib] = src[ib][iorb]
- */
-inline void build_transposed_panel(const int bxyz, const int na_grid, const int* const block_index, const bool* const* const cal_flag,
-    const double* const* const src, double* const* const dst_T)
-{
-    for (int ib = 0; ib < bxyz; ++ib)
+    double* first_data()
     {
-        const double* const src_row = src[ib];
-
-        for (int ia = 0; ia < na_grid; ++ia)
-        {
-            const int orbital_begin = block_index[ia];
-
-            const int orbital_end = block_index[ia + 1];
-
-            if (cal_flag[ib][ia])
-            {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
-                {
-                    dst_T[iorb][ib] = src_row[iorb];
-                }
-            }
-            else
-            {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
-                {
-                    dst_T[iorb][ib] = 0.0;
-                }
-            }
-        }
+        return first_.data();
     }
-}
 
-/**
- * @brief 生成一个带缩放和 cal_flag 遮罩的转置面板。
- *
- * 输出：
- *
- *     dst_T[iorb][ib]
- *         = scale[ib] * src[ib][iorb]
- */
-inline void build_scaled_transposed_panel(const int bxyz, const int na_grid, const int* const block_index,
-    const bool* const* const cal_flag, const double* const scale, const double* const* const src, double* const* const dst_T)
-{
-    for (int ib = 0; ib < bxyz; ++ib)
+    double* second_data()
     {
-        const double* const src_row = src[ib];
-
-        const double scale_value = scale[ib];
-
-        for (int ia = 0; ia < na_grid; ++ia)
-        {
-            const int orbital_begin = block_index[ia];
-
-            const int orbital_end = block_index[ia + 1];
-
-            if (cal_flag[ib][ia])
-            {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
-                {
-                    dst_T[iorb][ib] = scale_value
-                        * src_row[iorb];
-                }
-            }
-            else
-            {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
-                {
-                    dst_T[iorb][ib] = 0.0;
-                }
-            }
-        }
+        return second_.data();
     }
-}
+
+    const double* const* first_rows() const
+    {
+        return first_rows_.data();
+    }
+
+    const double* const* second_rows() const
+    {
+        return second_rows_.data();
+    }
+
+private:
+    int rows_ = 0;
+    int bxyz_ = 0;
+    std::vector<double> first_;
+    std::vector<double> second_;
+    std::vector<const double*> first_rows_;
+    std::vector<const double*> second_rows_;
+};
 
 } // 匿名命名空间
 
@@ -247,6 +167,8 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
         std::vector<double>
             vldr3(this->bxyz, 0.0);
 
+        TransposedPanelWorkspace panel_workspace;
+
 #pragma omp for schedule(dynamic)
         for (int grid_index = 0;
              grid_index < this->nbxx;
@@ -268,11 +190,9 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
             ModuleBase::Array_Pool<bool>
                 cal_flag(this->bxyz, max_size);
 
-            Gint_Tools::get_gint_vldr3(vldr3.data(), inout->vl, this->bxyz, this->bx, this->by, this->bz, this->nplane,
-                this->gridt ->start_ind[grid_index], ncyz, dv);
+            Gint_Tools::get_gint_vldr3(vldr3.data(), inout->vl, this->bxyz, this->bx, this->by, this->bz, this->nplane, this->gridt ->start_ind[grid_index], ncyz, dv);
 
-            Gint_Tools::get_block_info(*this->gridt, this->bxyz, na_grid, grid_index, block_iw.data(), block_index.data(),
-                block_size.data(), cal_flag.get_ptr_2D());
+            Gint_Tools::get_block_info(*this->gridt, this->bxyz, na_grid, grid_index, block_iw.data(), block_index.data(), block_size.data(), cal_flag.get_ptr_2D());
 
             const int LD_pool = block_index[na_grid];
 
@@ -288,8 +208,7 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
             // -------------------------------------------------------------
             t_start = std::chrono::steady_clock::now();
 
-            Gint_Tools::cal_psir_ylm(*this->gridt, this->bxyz, na_grid, grid_index, delta_r, block_index.data(), block_size.data(),
-                cal_flag.get_ptr_2D(), psir_ylm.get_ptr_2D());
+            Gint_Tools::cal_psir_ylm(*this->gridt, this->bxyz, na_grid, grid_index, delta_r, block_index.data(), block_size.data(), cal_flag.get_ptr_2D(), psir_ylm.get_ptr_2D());
 
             // 保留原代码对 psir_func_2 的求值语义；当前 vlocal 收缩仍不使用其结果。
             const ModuleBase::Array_Pool<double>& psir_ylm_2 =
@@ -306,29 +225,20 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
             // -------------------------------------------------------------
             t_start = std::chrono::steady_clock::now();
 
-            ModuleBase::Array_Pool<double> psir_ylm_T(LD_pool, this->bxyz);
-            ModuleBase::Array_Pool<double> psir_vlbr3_T(LD_pool, this->bxyz);
+            panel_workspace.prepare(LD_pool, this->bxyz);
+            double* right_T = panel_workspace.first_data();
+            double* left_T = panel_workspace.second_data();
+            const double* psir_ylm_flat = psir_ylm.get_ptr_2D()[0];
 
             if (!this->psir_func_1)
             {
-                /*
-                 * 同源路径：每个 psir_ylm 元素只显式读取一次，在同一次
-                 * ib-ia-iorb 遍历中生成两个转置面板并构造原子位掩码。
-                 */
-                GintVlocalFusion::build_same_source_transposed_panels_and_masks(this->bxyz, na_grid, block_index.data(),
-                    cal_flag.get_ptr_2D(), vldr3.data(), psir_ylm.get_ptr_2D(), psir_ylm_T.get_ptr_2D(), psir_vlbr3_T.get_ptr_2D(), 1);
+                GintVlocalFusion::build_same_source_transposed_panels_and_masks(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), vldr3.data(), psir_ylm_flat, right_T, left_T, 1);
             }
             else
             {
-                /*
-                 * 不同源路径：右面板读取 psir_ylm，左面板读取变换后的
-                 * psir_ylm_1，仍在一次循环中生成两个最终转置面板。
-                 */
-                const ModuleBase::Array_Pool<double>& psir_ylm_1 = this->psir_func_1(psir_ylm, *this->gridt, grid_index, 0, block_iw,
-                    block_size, block_index, cal_flag);
+                const ModuleBase::Array_Pool<double>& psir_ylm_1 = this->psir_func_1(psir_ylm, *this->gridt, grid_index, 0, block_iw, block_size, block_index, cal_flag);
 
-                GintVlocalFusion::build_two_transposed_panels_and_masks(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(),
-                    vldr3.data(), psir_ylm.get_ptr_2D(), psir_ylm_1.get_ptr_2D(), psir_ylm_T.get_ptr_2D(), psir_vlbr3_T.get_ptr_2D(), 1);
+                GintVlocalFusion::build_two_source_transposed_panels_and_masks(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), vldr3.data(), psir_ylm_flat, psir_ylm_1.get_ptr_2D()[0], right_T, left_T, 1);
             }
 
             t_end = std::chrono::steady_clock::now();
@@ -341,8 +251,7 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
 
             ModuleBase::timer::tick("Handy_Test", "cal_meshball_vlocal");
 
-            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                psir_ylm_T.get_ptr_2D(), psir_vlbr3_T.get_ptr_2D(), &hRGint_thread);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &hRGint_thread);
 
             ModuleBase::timer::tick("Handy_Test", "cal_meshball_vlocal");
 
@@ -365,8 +274,7 @@ void Gint::gint_kernel_vlocal(Gint_inout* inout)
         }
     }
 
-    std::printf("  [Total CPU Core-Time] prep: %8.4f s" " | psir: %8.4f s" " | panels: %8.4f s" " | meshball: %8.4f s\n", total_time_prep,
-        total_time_psir, total_time_panels, total_time_meshball);
+    std::printf("  [Total CPU Core-Time] prep: %8.4f s" " | psir: %8.4f s" " | panels: %8.4f s" " | meshball: %8.4f s\n", total_time_prep, total_time_psir, total_time_panels, total_time_meshball);
 
     ModuleBase::TITLE("Gint_interface", "cal_gint_vlocal");
     ModuleBase::timer::tick("Gint_interface", "cal_gint_vlocal");
@@ -434,6 +342,8 @@ void Gint::gint_kernel_dvlocal(Gint_inout* inout)
         std::vector<double>
             vldr3(this->bxyz, 0.0);
 
+        TransposedPanelWorkspace panel_workspace;
+
 #pragma omp for schedule(dynamic)
         for (int grid_index = 0;
              grid_index < this->nbxx;
@@ -447,14 +357,12 @@ void Gint::gint_kernel_dvlocal(Gint_inout* inout)
                 continue;
             }
 
-            Gint_Tools::get_gint_vldr3(vldr3.data(), inout->vl, this->bxyz, this->bx, this->by, this->bz, this->nplane,
-                this->gridt ->start_ind[grid_index], ncyz, dv);
+            Gint_Tools::get_gint_vldr3(vldr3.data(), inout->vl, this->bxyz, this->bx, this->by, this->bz, this->nplane, this->gridt ->start_ind[grid_index], ncyz, dv);
 
             ModuleBase::Array_Pool<bool>
                 cal_flag(this->bxyz, max_size);
 
-            Gint_Tools::get_block_info(*this->gridt, this->bxyz, na_grid, grid_index, block_iw.data(), block_index.data(),
-                block_size.data(), cal_flag.get_ptr_2D());
+            Gint_Tools::get_block_info(*this->gridt, this->bxyz, na_grid, grid_index, block_iw.data(), block_index.data(), block_size.data(), cal_flag.get_ptr_2D());
 
             const int LD_pool = block_index[na_grid];
 
@@ -470,55 +378,26 @@ void Gint::gint_kernel_dvlocal(Gint_inout* inout)
             ModuleBase::Array_Pool<double>
                 dpsir_ylm_z(this->bxyz, LD_pool);
 
-            Gint_Tools::cal_dpsir_ylm(*this->gridt, this->bxyz, na_grid, grid_index, delta_r, block_index.data(), block_size.data(),
-                cal_flag.get_ptr_2D(), psir_ylm.get_ptr_2D(), dpsir_ylm_x.get_ptr_2D(), dpsir_ylm_y.get_ptr_2D(), dpsir_ylm_z.get_ptr_2D());
+            Gint_Tools::cal_dpsir_ylm(*this->gridt, this->bxyz, na_grid, grid_index, delta_r, block_index.data(), block_size.data(), cal_flag.get_ptr_2D(), psir_ylm.get_ptr_2D(), dpsir_ylm_x.get_ptr_2D(), dpsir_ylm_y.get_ptr_2D(), dpsir_ylm_z.get_ptr_2D());
 
             /*
-             * 左面板 f_mu(r)=v(r)*psi_mu(r)*dv 会被 x/y/z
-             * 三个方向共同使用，因此只生成一次。
+             * 第二个缓冲区保存可被x/y/z复用的左面板，第一个缓冲区依次
+             * 保存三个方向的导数右面板。
              */
-            ModuleBase::Array_Pool<double>
-                psir_vlbr3_T(LD_pool, this->bxyz);
+            panel_workspace.prepare(LD_pool, this->bxyz);
+            double* derivative_T = panel_workspace.first_data();
+            double* psir_vlbr3_T = panel_workspace.second_data();
 
-            GintVlocalFusion::
-                build_scaled_transposed_panel_and_masks(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), vldr3.data(),
-                    psir_ylm.get_ptr_2D(), psir_vlbr3_T.get_ptr_2D(), 3);
+            GintVlocalFusion::build_scaled_transposed_panel_and_masks(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), vldr3.data(), psir_ylm.get_ptr_2D()[0], psir_vlbr3_T, 3);
 
-            // x 方向。
-            {
-                ModuleBase::Array_Pool<double>
-                    dpsir_ylm_x_T(LD_pool, this->bxyz);
+            GintVlocalFusion::build_transposed_panel(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), dpsir_ylm_x.get_ptr_2D()[0], derivative_T);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &pvdpRx_thread);
 
-                build_transposed_panel(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), dpsir_ylm_x.get_ptr_2D(),
-                    dpsir_ylm_x_T .get_ptr_2D());
+            GintVlocalFusion::build_transposed_panel(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), dpsir_ylm_y.get_ptr_2D()[0], derivative_T);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &pvdpRy_thread);
 
-                this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                    dpsir_ylm_x_T .get_ptr_2D(), psir_vlbr3_T .get_ptr_2D(), &pvdpRx_thread);
-            }
-
-            // y 方向。
-            {
-                ModuleBase::Array_Pool<double>
-                    dpsir_ylm_y_T(LD_pool, this->bxyz);
-
-                build_transposed_panel(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), dpsir_ylm_y.get_ptr_2D(),
-                    dpsir_ylm_y_T .get_ptr_2D());
-
-                this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                    dpsir_ylm_y_T .get_ptr_2D(), psir_vlbr3_T .get_ptr_2D(), &pvdpRy_thread);
-            }
-
-            // z 方向。
-            {
-                ModuleBase::Array_Pool<double>
-                    dpsir_ylm_z_T(LD_pool, this->bxyz);
-
-                build_transposed_panel(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), dpsir_ylm_z.get_ptr_2D(),
-                    dpsir_ylm_z_T .get_ptr_2D());
-
-                this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                    dpsir_ylm_z_T .get_ptr_2D(), psir_vlbr3_T .get_ptr_2D(), &pvdpRz_thread);
-            }
+            GintVlocalFusion::build_transposed_panel(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), dpsir_ylm_z.get_ptr_2D()[0], derivative_T);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &pvdpRz_thread);
         }
 
 #pragma omp critical(gint_k)
@@ -582,6 +461,8 @@ void Gint::gint_kernel_vlocal_meta(Gint_inout* inout)
         std::vector<double>
             vkdr3(this->bxyz, 0.0);
 
+        TransposedPanelWorkspace panel_workspace;
+
 #pragma omp for schedule(dynamic)
         for (int grid_index = 0;
              grid_index < this->nbxx;
@@ -595,17 +476,14 @@ void Gint::gint_kernel_vlocal_meta(Gint_inout* inout)
                 continue;
             }
 
-            Gint_Tools::get_gint_vldr3(vldr3.data(), inout->vl, this->bxyz, this->bx, this->by, this->bz, this->nplane,
-                this->gridt ->start_ind[grid_index], ncyz, dv);
+            Gint_Tools::get_gint_vldr3(vldr3.data(), inout->vl, this->bxyz, this->bx, this->by, this->bz, this->nplane, this->gridt ->start_ind[grid_index], ncyz, dv);
 
-            Gint_Tools::get_gint_vldr3(vkdr3.data(), inout->vofk, this->bxyz, this->bx, this->by, this->bz, this->nplane,
-                this->gridt ->start_ind[grid_index], ncyz, dv);
+            Gint_Tools::get_gint_vldr3(vkdr3.data(), inout->vofk, this->bxyz, this->bx, this->by, this->bz, this->nplane, this->gridt ->start_ind[grid_index], ncyz, dv);
 
             ModuleBase::Array_Pool<bool>
                 cal_flag(this->bxyz, max_size);
 
-            Gint_Tools::get_block_info(*this->gridt, this->bxyz, na_grid, grid_index, block_iw.data(), block_index.data(),
-                block_size.data(), cal_flag.get_ptr_2D());
+            Gint_Tools::get_block_info(*this->gridt, this->bxyz, na_grid, grid_index, block_iw.data(), block_index.data(), block_size.data(), cal_flag.get_ptr_2D());
 
             const int LD_pool = block_index[na_grid];
 
@@ -621,74 +499,23 @@ void Gint::gint_kernel_vlocal_meta(Gint_inout* inout)
             ModuleBase::Array_Pool<double>
                 dpsir_ylm_z(this->bxyz, LD_pool);
 
-            Gint_Tools::cal_dpsir_ylm(*this->gridt, this->bxyz, na_grid, grid_index, delta_r, block_index.data(), block_size.data(),
-                cal_flag.get_ptr_2D(), psir_ylm.get_ptr_2D(), dpsir_ylm_x.get_ptr_2D(), dpsir_ylm_y.get_ptr_2D(), dpsir_ylm_z.get_ptr_2D());
+            Gint_Tools::cal_dpsir_ylm(*this->gridt, this->bxyz, na_grid, grid_index, delta_r, block_index.data(), block_size.data(), cal_flag.get_ptr_2D(), psir_ylm.get_ptr_2D(), dpsir_ylm_x.get_ptr_2D(), dpsir_ylm_y.get_ptr_2D(), dpsir_ylm_z.get_ptr_2D());
 
-            /*
-             * 每个贡献均在局部作用域内生成两个转置面板，
-             * 收缩完成后立即释放，避免同时持有多组完整面板。
-             */
+            panel_workspace.prepare(LD_pool, this->bxyz);
+            double* right_T = panel_workspace.first_data();
+            double* left_T = panel_workspace.second_data();
 
-            // 普通局域势贡献。
-            {
-                ModuleBase::Array_Pool<double>
-                    right_T(LD_pool, this->bxyz);
+            GintVlocalFusion::build_same_source_transposed_panels_and_masks(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), vldr3.data(), psir_ylm.get_ptr_2D()[0], right_T, left_T, 4);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &hRGint_thread);
 
-                ModuleBase::Array_Pool<double>
-                    left_T(LD_pool, this->bxyz);
+            GintVlocalFusion::build_same_source_transposed_panels_without_masks(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), vkdr3.data(), dpsir_ylm_x.get_ptr_2D()[0], right_T, left_T);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &hRGint_thread);
 
-                GintVlocalFusion::
-                    build_two_transposed_panels_and_masks(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), vldr3.data(),
-                        psir_ylm.get_ptr_2D(), psir_ylm.get_ptr_2D(), right_T.get_ptr_2D(), left_T.get_ptr_2D(), 4);
+            GintVlocalFusion::build_same_source_transposed_panels_without_masks(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), vkdr3.data(), dpsir_ylm_y.get_ptr_2D()[0], right_T, left_T);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &hRGint_thread);
 
-                this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                    right_T.get_ptr_2D(), left_T.get_ptr_2D(), &hRGint_thread);
-            }
-
-            // x 方向 meta-GGA 贡献。
-            {
-                ModuleBase::Array_Pool<double>
-                    right_T(LD_pool, this->bxyz);
-
-                ModuleBase::Array_Pool<double>
-                    left_T(LD_pool, this->bxyz);
-
-                build_two_transposed_panels_without_masks(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), vkdr3.data(),
-                    dpsir_ylm_x .get_ptr_2D(), dpsir_ylm_x .get_ptr_2D(), right_T.get_ptr_2D(), left_T.get_ptr_2D());
-
-                this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                    right_T.get_ptr_2D(), left_T.get_ptr_2D(), &hRGint_thread);
-            }
-
-            // y 方向 meta-GGA 贡献。
-            {
-                ModuleBase::Array_Pool<double>
-                    right_T(LD_pool, this->bxyz);
-
-                ModuleBase::Array_Pool<double>
-                    left_T(LD_pool, this->bxyz);
-
-                build_two_transposed_panels_without_masks(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), vkdr3.data(),
-                    dpsir_ylm_y .get_ptr_2D(), dpsir_ylm_y .get_ptr_2D(), right_T.get_ptr_2D(), left_T.get_ptr_2D());
-
-                this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                    right_T.get_ptr_2D(), left_T.get_ptr_2D(), &hRGint_thread);
-            }
-
-            // z 方向 meta-GGA 贡献。
-            {
-                ModuleBase::Array_Pool<double>
-                    right_T(LD_pool, this->bxyz);
-
-                ModuleBase::Array_Pool<double>
-                    left_T(LD_pool, this->bxyz);
-
-                build_two_transposed_panels_without_masks(this->bxyz, na_grid, block_index.data(), cal_flag.get_ptr_2D(), vkdr3.data(),
-                    dpsir_ylm_z .get_ptr_2D(), dpsir_ylm_z .get_ptr_2D(), right_T.get_ptr_2D(), left_T.get_ptr_2D());
-
-                this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(),
-                    right_T.get_ptr_2D(), left_T.get_ptr_2D(), &hRGint_thread);
-            }
+            GintVlocalFusion::build_same_source_transposed_panels_without_masks(this->bxyz, na_grid, LD_pool, block_index.data(), cal_flag.get_ptr_2D(), vkdr3.data(), dpsir_ylm_z.get_ptr_2D()[0], right_T, left_T);
+            this->cal_meshball_vlocal(na_grid, LD_pool, block_size.data(), block_index.data(), grid_index, cal_flag.get_ptr_2D(), panel_workspace.first_rows(), panel_workspace.second_rows(), &hRGint_thread);
         }
 
 #pragma omp critical

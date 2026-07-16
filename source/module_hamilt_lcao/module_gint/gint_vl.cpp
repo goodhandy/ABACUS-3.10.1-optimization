@@ -38,7 +38,7 @@ namespace
  *
  * 本函数用于计算两个原子共同有效的网格点数量 cal_pair_num。
  */
-inline int popcount64(const std::uint64_t value)
+int popcount64(const std::uint64_t value)
 {
     return __builtin_popcountll(static_cast<unsigned long long>(value));
 }
@@ -55,7 +55,7 @@ inline int popcount64(const std::uint64_t value)
  * __builtin_ctzll(0) 的行为未定义，因此调用本函数之前
  * 必须保证 value != 0。
  */
-inline int ctz64(const std::uint64_t value)
+int ctz64(const std::uint64_t value)
 {
     return __builtin_ctzll(static_cast<unsigned long long>(value));
 }
@@ -72,7 +72,7 @@ inline int ctz64(const std::uint64_t value)
  * __builtin_clzll(0) 的行为未定义，因此调用本函数之前
  * 必须保证 value != 0。
  */
-inline int clz64(const std::uint64_t value)
+int clz64(const std::uint64_t value)
 {
     return __builtin_clzll(static_cast<unsigned long long>(value));
 }
@@ -109,8 +109,7 @@ thread_local PreparedMaskCache prepared_mask_cache;
 /**
  * @brief 初始化本线程的掩码缓存并返回可写对象。
  */
-inline PreparedMaskCache& begin_prepare_mask_cache(const int na_grid, const int bxyz, const bool* const* const cal_flag,
-    const int expected_uses)
+PreparedMaskCache& begin_prepare_mask_cache(const int na_grid, const int bxyz, const bool* const* const cal_flag, const int expected_uses)
 {
     PreparedMaskCache& cache = prepared_mask_cache;
 
@@ -143,8 +142,7 @@ inline PreparedMaskCache& begin_prepare_mask_cache(const int na_grid, const int 
  * - 或缓存维度、cal_flag 地址不匹配；
  * - 或缓存允许的消费次数已经用完。
  */
-inline const std::uint64_t* try_acquire_prepared_masks(const int na_grid, const int bxyz, const int mask_words,
-    const bool* const* const cal_flag)
+const std::uint64_t* try_acquire_prepared_masks(const int na_grid, const int bxyz, const int mask_words, const bool* const* const cal_flag)
 {
     PreparedMaskCache& cache = prepared_mask_cache;
 
@@ -197,8 +195,7 @@ inline const std::uint64_t* try_acquire_prepared_masks(const int na_grid, const 
  * 3. 后续原子对求交只需要按位与操作；
  * 4. 自动兼容 bxyz>128 的情况。
  */
-inline void build_atom_masks(const int na_grid, const int bxyz, const int mask_words, const bool* const* const cal_flag,
-    std::uint64_t* const atom_masks)
+void build_atom_masks(const int na_grid, const int bxyz, const int mask_words, const bool* const* const cal_flag, std::uint64_t* const atom_masks)
 {
     // 位掩码总字数 = 原子数 × 每个原子所需的64位字数。
     const std::size_t total_words = static_cast<std::size_t>(na_grid) * mask_words;
@@ -256,8 +253,7 @@ inline void build_atom_masks(const int na_grid, const int bxyz, const int mask_w
  * - 稀疏分支仍然对每个有效网格点调用一次 k=1 的 DGEMM；
  * - 有效网格点集合、DGEMM 调用次数和调用顺序保持不变。
  */
-inline bool analyse_pair_mask(const std::uint64_t* const mask1, const std::uint64_t* const mask2, const int mask_words, int& first_ib,
-    int& last_ib, int& cal_pair_num)
+bool analyse_pair_mask(const std::uint64_t* const mask1, const std::uint64_t* const mask2, const int mask_words, int& first_ib, int& last_ib, int& cal_pair_num)
 {
     // 记录第一个和最后一个非零交集字的位置。
     int first_word = -1;
@@ -333,16 +329,12 @@ namespace GintVlocalFusion
 {
 
 /**
- * @brief 同源路径一次遍历生成两个转置面板和原子位掩码。
- *
- * 输入源只有 psir_ylm：
- *     psir_right_T[iorb][ib] = src[ib][iorb]
- *     psir_left_T[iorb][ib] = scale[ib] * src[ib][iorb]
- *
- * 每个源元素只显式读取一次，同时写入两个最终面板。
+ * @brief 同源单循环：一次读取源元素，同时生成两个扁平转置面板和位掩码。
  */
-void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, const int* block_index, const bool* const* cal_flag,
-    const double* scale, const double* const* src, double* const* psir_right_T, double* const* psir_left_T, int expected_mask_uses)
+void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                                                   const bool* const* cal_flag, const double* scale,
+                                                   const double* src, double* right_T, double* left_T,
+                                                   int expected_mask_uses)
 {
     PreparedMaskCache& cache = begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
 
@@ -351,7 +343,7 @@ void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, const 
         const int word_index = ib / 64;
         const std::uint64_t bit = std::uint64_t{1} << (ib % 64);
         const double scale_value = scale[ib];
-        const double* src_row = src[ib];
+        const double* src_row = src + static_cast<std::size_t>(ib) * LD_pool;
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
@@ -365,16 +357,18 @@ void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, const 
                 for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
                     const double value = src_row[iorb];
-                    psir_right_T[iorb][ib] = value;
-                    psir_left_T[iorb][ib] = scale_value * value;
+                    const std::size_t dst = static_cast<std::size_t>(iorb) * bxyz + ib;
+                    right_T[dst] = value;
+                    left_T[dst] = scale_value * value;
                 }
             }
             else
             {
                 for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
-                    psir_right_T[iorb][ib] = 0.0;
-                    psir_left_T[iorb][ib] = 0.0;
+                    const std::size_t dst = static_cast<std::size_t>(iorb) * bxyz + ib;
+                    right_T[dst] = 0.0;
+                    left_T[dst] = 0.0;
                 }
             }
         }
@@ -382,75 +376,46 @@ void build_same_source_transposed_panels_and_masks(int bxyz, int na_grid, const 
 }
 
 /**
- * @brief 一次遍历同时生成两个转置面板和原子位掩码。
- *
- * 输出：
- *
- *     psir_right_T[iorb][ib]
- *         = psir_right_source[ib][iorb]
- *
- *     psir_left_T[iorb][ib]
- *         = scale[ib] * psir_left_source[ib][iorb]
- *
- * 同时将 cal_flag[ib][ia] 压缩到线程本地 uint64_t 位掩码中。
- *
- * 这样 cal_flag 只在面板生成阶段扫描一次，
- * cal_meshball_vlocal 不再重复执行完整的掩码构造遍历。
+ * @brief 不同源单循环：分别读取两个普通布局源，同时生成两个扁平转置面板和位掩码。
  */
-void build_two_transposed_panels_and_masks(const int bxyz, const int na_grid, const int* const block_index,
-    const bool* const* const cal_flag, const double* const scale, const double* const* const psir_right_source,
-    const double* const* const psir_left_source, double* const* const psir_right_T, double* const* const psir_left_T,
-    const int expected_mask_uses)
+void build_two_source_transposed_panels_and_masks(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                                                  const bool* const* cal_flag, const double* scale,
+                                                  const double* right_src, const double* left_src,
+                                                  double* right_T, double* left_T, int expected_mask_uses)
 {
     PreparedMaskCache& cache = begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
 
     for (int ib = 0; ib < bxyz; ++ib)
     {
         const int word_index = ib / 64;
-
-        const int bit_index = ib % 64;
-
-        const std::uint64_t bit = std::uint64_t{1} << bit_index;
-
-        const double* const right_src_row = psir_right_source[ib];
-
-        const double* const left_src_row = psir_left_source[ib];
-
+        const std::uint64_t bit = std::uint64_t{1} << (ib % 64);
         const double scale_value = scale[ib];
+        const double* right_row = right_src + static_cast<std::size_t>(ib) * LD_pool;
+        const double* left_row = left_src + static_cast<std::size_t>(ib) * LD_pool;
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
             const int orbital_begin = block_index[ia];
-
             const int orbital_end = block_index[ia + 1];
 
-            const bool active = cal_flag[ib][ia];
-
-            if (active)
+            if (cal_flag[ib][ia])
             {
-                cache.words[
-                    static_cast<std::size_t>(ia)
-                    * cache.mask_words
-                    + word_index] |= bit;
+                cache.words[static_cast<std::size_t>(ia) * cache.mask_words + word_index] |= bit;
 
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
-                    psir_right_T[iorb][ib] = right_src_row[iorb];
-
-                    psir_left_T[iorb][ib] = scale_value
-                        * left_src_row[iorb];
+                    const std::size_t dst = static_cast<std::size_t>(iorb) * bxyz + ib;
+                    right_T[dst] = right_row[iorb];
+                    left_T[dst] = scale_value * left_row[iorb];
                 }
             }
             else
             {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
-                    psir_right_T[iorb][ib] = 0.0;
-                    psir_left_T[iorb][ib] = 0.0;
+                    const std::size_t dst = static_cast<std::size_t>(iorb) * bxyz + ib;
+                    right_T[dst] = 0.0;
+                    left_T[dst] = 0.0;
                 }
             }
         }
@@ -458,59 +423,114 @@ void build_two_transposed_panels_and_masks(const int bxyz, const int na_grid, co
 }
 
 /**
- * @brief 一次遍历生成缩放后的左转置面板和原子位掩码。
- *
- * 该函数用于 dvlocal：
- * 左面板会被 x/y/z 三次收缩共同复用，因此位掩码也允许消费3次。
+ * @brief 生成缩放后的扁平转置面板，同时构造可复用位掩码。
  */
-void build_scaled_transposed_panel_and_masks(const int bxyz, const int na_grid, const int* const block_index,
-    const bool* const* const cal_flag, const double* const scale, const double* const* const src, double* const* const dst_T,
-    const int expected_mask_uses)
+void build_scaled_transposed_panel_and_masks(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                                             const bool* const* cal_flag, const double* scale,
+                                             const double* src, double* dst_T, int expected_mask_uses)
 {
     PreparedMaskCache& cache = begin_prepare_mask_cache(na_grid, bxyz, cal_flag, expected_mask_uses);
 
     for (int ib = 0; ib < bxyz; ++ib)
     {
         const int word_index = ib / 64;
-
-        const int bit_index = ib % 64;
-
-        const std::uint64_t bit = std::uint64_t{1} << bit_index;
-
-        const double* const src_row = src[ib];
-
+        const std::uint64_t bit = std::uint64_t{1} << (ib % 64);
         const double scale_value = scale[ib];
+        const double* src_row = src + static_cast<std::size_t>(ib) * LD_pool;
 
         for (int ia = 0; ia < na_grid; ++ia)
         {
             const int orbital_begin = block_index[ia];
-
             const int orbital_end = block_index[ia + 1];
 
-            const bool active = cal_flag[ib][ia];
-
-            if (active)
+            if (cal_flag[ib][ia])
             {
-                cache.words[
-                    static_cast<std::size_t>(ia)
-                    * cache.mask_words
-                    + word_index] |= bit;
+                cache.words[static_cast<std::size_t>(ia) * cache.mask_words + word_index] |= bit;
 
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
-                    dst_T[iorb][ib] = scale_value
-                        * src_row[iorb];
+                    dst_T[static_cast<std::size_t>(iorb) * bxyz + ib] = scale_value * src_row[iorb];
                 }
             }
             else
             {
-                for (int iorb = orbital_begin;
-                     iorb < orbital_end;
-                     ++iorb)
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
                 {
-                    dst_T[iorb][ib] = 0.0;
+                    dst_T[static_cast<std::size_t>(iorb) * bxyz + ib] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief 生成一个扁平转置面板，不重复构造位掩码。
+ */
+void build_transposed_panel(int bxyz, int na_grid, int LD_pool, const int* block_index,
+                            const bool* const* cal_flag, const double* src, double* dst_T)
+{
+    for (int ib = 0; ib < bxyz; ++ib)
+    {
+        const double* src_row = src + static_cast<std::size_t>(ib) * LD_pool;
+
+        for (int ia = 0; ia < na_grid; ++ia)
+        {
+            const int orbital_begin = block_index[ia];
+            const int orbital_end = block_index[ia + 1];
+
+            if (cal_flag[ib][ia])
+            {
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
+                {
+                    dst_T[static_cast<std::size_t>(iorb) * bxyz + ib] = src_row[iorb];
+                }
+            }
+            else
+            {
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
+                {
+                    dst_T[static_cast<std::size_t>(iorb) * bxyz + ib] = 0.0;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief 同源单循环生成两个扁平转置面板，不重复构造位掩码。
+ */
+void build_same_source_transposed_panels_without_masks(int bxyz, int na_grid, int LD_pool,
+                                                       const int* block_index, const bool* const* cal_flag,
+                                                       const double* scale, const double* src,
+                                                       double* right_T, double* left_T)
+{
+    for (int ib = 0; ib < bxyz; ++ib)
+    {
+        const double scale_value = scale[ib];
+        const double* src_row = src + static_cast<std::size_t>(ib) * LD_pool;
+
+        for (int ia = 0; ia < na_grid; ++ia)
+        {
+            const int orbital_begin = block_index[ia];
+            const int orbital_end = block_index[ia + 1];
+
+            if (cal_flag[ib][ia])
+            {
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
+                {
+                    const double value = src_row[iorb];
+                    const std::size_t dst = static_cast<std::size_t>(iorb) * bxyz + ib;
+                    right_T[dst] = value;
+                    left_T[dst] = scale_value * value;
+                }
+            }
+            else
+            {
+                for (int iorb = orbital_begin; iorb < orbital_end; ++iorb)
+                {
+                    const std::size_t dst = static_cast<std::size_t>(iorb) * bxyz + ib;
+                    right_T[dst] = 0.0;
+                    left_T[dst] = 0.0;
                 }
             }
         }
@@ -553,6 +573,7 @@ void Gint::cal_meshball_vlocal(
     // 2. 左面板的局域势缩放与布局转换。
     //
     // 因此本函数中不再分配完整转置缓冲区，也不再执行显式转置。
+    // 扁平工作区不再进行行距填充，每条轨道行长度就是 bxyz。
     const int ldt = bxyz_local;
 
     // ---------------------------------------------------------------------
